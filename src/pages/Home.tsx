@@ -27,6 +27,8 @@ import {
   BarChart2,
   Zap,
   Pin,
+  EyeOff,
+  GitCompare,
 } from 'lucide-react';
 import { ConnectionPanel } from '../components/ConnectionPanel';
 import { ToolCard } from '../components/ToolCard';
@@ -84,8 +86,8 @@ const tools = [
     featured: true,
   },
   {
-    name: 'API Report Dashboard',
-    description: 'API discovery stats, learnt schema parsing, and detailed endpoint report with consolidated Excel export across multiple load balancers.',
+    name: 'API Discovery Report Dashboard',
+    description: 'High-level API Discovery overview, raw schema downloads, and per-LB schema detail with Excel & PDF export across multiple load balancers.',
     icon: BarChart2,
     to: '/api-report',
     tags: [
@@ -163,10 +165,11 @@ const tools = [
     to: '/http-sanity-checker',
     tags: [
       { label: 'Audit', type: 'report' as const },
-      { label: 'Live Traffic', type: 'safe' as const },
+      { label: 'Standalone', type: 'safe' as const },
     ],
     badge: 'New',
     featured: true,
+    standalone: true,
   },
   {
     name: 'Prefix Builder',
@@ -258,6 +261,33 @@ const tools = [
     ],
     badge: 'New',
     featured: true,
+    standalone: true,
+  },
+  {
+    name: 'Diff Checker',
+    description: 'Side-by-side and unified text diff with char-level highlighting, semantic JSON/YAML/XML diff, 3-way merge, ignore patterns, and GitHub PR import. Runs entirely in your browser.',
+    icon: GitCompare,
+    to: '/diff-checker',
+    tags: [
+      { label: 'Compare', type: 'report' as const },
+      { label: 'Standalone', type: 'safe' as const },
+    ],
+    badge: 'New',
+    featured: true,
+    standalone: true,
+  },
+  {
+    name: 'Anonymizer',
+    description: 'Reversible find-and-replace for txt/docx/pptx/xlsx files. Redact customer-identifying content before sharing, restore real values before delivery. Runs entirely in your browser.',
+    icon: EyeOff,
+    to: '/anonymizer',
+    tags: [
+      { label: 'Redact', type: 'report' as const },
+      { label: 'Standalone', type: 'safe' as const },
+    ],
+    badge: 'New',
+    featured: true,
+    standalone: true,
   },
   {
     name: 'CDN Factory',
@@ -396,7 +426,7 @@ export function Home() {
                 <ToolCard
                   key={tool.name}
                   {...tool}
-                  disabled={tool.disabled || !isConnected}
+                  disabled={tool.disabled || (!tool.standalone && !isConnected)}
                   isPinned={true}
                   onTogglePin={() => togglePin(tool.name)}
                 />
@@ -411,7 +441,7 @@ export function Home() {
             <ToolCard
               key={tool.name}
               {...tool}
-              disabled={tool.disabled || !isConnected}
+              disabled={tool.disabled || (!tool.standalone && !isConnected)}
               isPinned={false}
               onTogglePin={tool.disabled ? undefined : () => togglePin(tool.name)}
             />

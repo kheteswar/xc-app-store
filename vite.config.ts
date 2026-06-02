@@ -97,11 +97,11 @@ function makeF5XCRequest(options: https.RequestOptions, postData?: string): Prom
     });
     
     req.on('error', reject);
-    req.setTimeout(30000, () => {
+    req.setTimeout(60000, () => {
       req.destroy();
       reject(new Error('Request timeout'));
     });
-    
+
     if (postData) {
       req.write(postData);
     }
@@ -138,42 +138,105 @@ function makeF5XCRequestRaw(options: https.RequestOptions, postData?: string): P
 }
 
 /**
- * Parse ZIP buffer — extract files (handles STORE and DEFLATE methods)
+ * Parse ZIP buffer — extract files (handles STORE and DEFLATE methods).
+ *
+ * F5 XC streams the swagger_spec ZIP with bit-3 of the general-purpose flag set,
+ * which leaves compressedSize=0 in the local file header. The authoritative
+ * sizes live in the Central Directory at the end of the file, so we parse
+ * that first and use the local header offsets it provides.
  */
 function parseZipBuffer(buffer: Buffer): Array<{ filename: string; data: Buffer }> {
   const files: Array<{ filename: string; data: Buffer }> = [];
-  let offset = 0;
 
-  while (offset + 30 <= buffer.length) {
-    const sig = buffer.readUInt32LE(offset);
-    if (sig !== 0x04034b50) break;  // Not a local file header
+  // 1. Locate the End of Central Directory Record (EOCD), scanning backward.
+  //    EOCD signature = 0x06054b50, comment field is up to 65535 bytes.
+  const EOCD_SIG = 0x06054b50;
+  const CDH_SIG = 0x02014b50;
+  const LFH_SIG = 0x04034b50;
 
-    const compressionMethod = buffer.readUInt16LE(offset + 8);
-    const compressedSize = buffer.readUInt32LE(offset + 18);
-    const filenameLength = buffer.readUInt16LE(offset + 26);
-    const extraLength = buffer.readUInt16LE(offset + 28);
+  let eocdOffset = -1;
+  const minScan = Math.max(0, buffer.length - 65557);
+  for (let i = buffer.length - 22; i >= minScan; i--) {
+    if (buffer.readUInt32LE(i) === EOCD_SIG) {
+      eocdOffset = i;
+      break;
+    }
+  }
 
-    const filename = buffer.toString('utf8', offset + 30, offset + 30 + filenameLength);
-    const dataStart = offset + 30 + filenameLength + extraLength;
+  if (eocdOffset === -1) {
+    // Fallback: try the original local-header walk for non-streaming ZIPs.
+    return parseZipBufferLinear(buffer);
+  }
+
+  const cdSize = buffer.readUInt32LE(eocdOffset + 12);
+  const cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+  if (cdOffset + cdSize > buffer.length) return parseZipBufferLinear(buffer);
+
+  // 2. Walk the Central Directory.
+  let p = cdOffset;
+  while (p + 46 <= cdOffset + cdSize) {
+    if (buffer.readUInt32LE(p) !== CDH_SIG) break;
+
+    const compressionMethod = buffer.readUInt16LE(p + 10);
+    const compressedSize = buffer.readUInt32LE(p + 20);
+    const filenameLen = buffer.readUInt16LE(p + 28);
+    const extraLen = buffer.readUInt16LE(p + 30);
+    const commentLen = buffer.readUInt16LE(p + 32);
+    const localHeaderOffset = buffer.readUInt32LE(p + 42);
+    const filename = buffer.toString('utf8', p + 46, p + 46 + filenameLen);
+    p += 46 + filenameLen + extraLen + commentLen;
+
+    // 3. Resolve the actual data start using the local file header.
+    if (localHeaderOffset + 30 > buffer.length) continue;
+    if (buffer.readUInt32LE(localHeaderOffset) !== LFH_SIG) continue;
+    const lfhFnameLen = buffer.readUInt16LE(localHeaderOffset + 26);
+    const lfhExtraLen = buffer.readUInt16LE(localHeaderOffset + 28);
+    const dataStart = localHeaderOffset + 30 + lfhFnameLen + lfhExtraLen;
+    if (dataStart + compressedSize > buffer.length) continue;
+
     const compressedData = buffer.slice(dataStart, dataStart + compressedSize);
 
     try {
       let data: Buffer;
       if (compressionMethod === 0) {
-        data = compressedData; // Stored
+        data = compressedData;
       } else if (compressionMethod === 8) {
-        data = zlib.inflateRawSync(compressedData); // Deflate
+        data = zlib.inflateRawSync(compressedData);
       } else {
-        offset = dataStart + compressedSize;
         continue;
       }
       files.push({ filename, data });
     } catch {
-      // Skip corrupt entries
+      // skip corrupt entry
     }
-    offset = dataStart + compressedSize;
   }
 
+  return files;
+}
+
+/** Linear scan of local file headers — only works when compressedSize is set in LFH. */
+function parseZipBufferLinear(buffer: Buffer): Array<{ filename: string; data: Buffer }> {
+  const files: Array<{ filename: string; data: Buffer }> = [];
+  let offset = 0;
+  while (offset + 30 <= buffer.length) {
+    const sig = buffer.readUInt32LE(offset);
+    if (sig !== 0x04034b50) break;
+    const compressionMethod = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const filenameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const filename = buffer.toString('utf8', offset + 30, offset + 30 + filenameLength);
+    const dataStart = offset + 30 + filenameLength + extraLength;
+    const compressedData = buffer.slice(dataStart, dataStart + compressedSize);
+    try {
+      let data: Buffer;
+      if (compressionMethod === 0) data = compressedData;
+      else if (compressionMethod === 8) data = zlib.inflateRawSync(compressedData);
+      else { offset = dataStart + compressedSize; continue; }
+      files.push({ filename, data });
+    } catch { /* skip */ }
+    offset = dataStart + compressedSize;
+  }
   return files;
 }
 
@@ -217,11 +280,45 @@ async function handleSwaggerParse(req: IncomingMessage, res: ServerResponse) {
     }
 
     // Parse the ZIP and extract JSON files
+    const sigHex = response.body.length >= 4
+      ? response.body.slice(0, 4).toString('hex')
+      : '(empty)';
     const files = parseZipBuffer(response.body);
     const jsonFiles = files.filter((f) => f.filename.endsWith('.json'));
-    console.log(`[SwaggerParse] Found ${jsonFiles.length} JSON files in ZIP for ${lbName}`);
+    console.log(`[SwaggerParse] ${lbName}: ${response.body.length} bytes, sig=${sigHex}, ${files.length} files, ${jsonFiles.length} JSON`);
 
-    const specs: Array<{ filename: string; fqdn: string; endpoints: Array<{ path: string; method: string; contentType: string }> }> = [];
+    const specs: Array<{
+      filename: string;
+      fqdn: string;
+      title?: string;
+      version?: string;
+      description?: string;
+      openapi?: string;
+      raw: any;
+      endpoints: Array<{
+        path: string;
+        method: string;
+        contentType: string;
+        summary?: string;
+        description?: string;
+        tags?: string[];
+        deprecated?: boolean;
+        operationId?: string;
+        parameters?: Array<{ name: string; in: string; required?: boolean; type?: string; description?: string }>;
+        requestBody?: { contentTypes: string[]; required?: boolean; schemaSummary?: string };
+        responses?: Array<{ code: string; description?: string; contentTypes?: string[] }>;
+        security?: string[];
+      }>;
+    }> = [];
+
+    function summarizeSchema(schema: any): string {
+      if (!schema || typeof schema !== 'object') return '';
+      if (schema.$ref) return schema.$ref.split('/').pop() || schema.$ref;
+      if (schema.type === 'array' && schema.items) return `array<${summarizeSchema(schema.items) || 'any'}>`;
+      if (schema.type) return schema.type;
+      if (schema.properties) return `object{${Object.keys(schema.properties).slice(0, 6).join(',')}${Object.keys(schema.properties).length > 6 ? '…' : ''}}`;
+      return '';
+    }
 
     for (const file of jsonFiles) {
       try {
@@ -229,20 +326,78 @@ async function handleSwaggerParse(req: IncomingMessage, res: ServerResponse) {
         const servers = spec.servers || [];
         const fqdn = servers.map((s: any) => s.url || '').join(', ');
         const paths = spec.paths || {};
-        const endpoints: Array<{ path: string; method: string; contentType: string }> = [];
+        const endpoints: typeof specs[number]['endpoints'] = [];
 
         for (const [pathKey, pathDetails] of Object.entries(paths)) {
-          for (const [method, methodDetails] of Object.entries(pathDetails as Record<string, any>)) {
+          const pathItem = pathDetails as Record<string, any>;
+          const sharedParams = Array.isArray(pathItem.parameters) ? pathItem.parameters : [];
+          for (const [method, methodDetails] of Object.entries(pathItem)) {
             if (!['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method.toLowerCase())) continue;
+            const op = methodDetails as Record<string, any>;
+
             let contentType = '-';
-            if (methodDetails.requestBody?.content) {
-              contentType = Object.keys(methodDetails.requestBody.content).join(', ');
+            let requestBody: { contentTypes: string[]; required?: boolean; schemaSummary?: string } | undefined;
+            if (op.requestBody?.content) {
+              const ctKeys = Object.keys(op.requestBody.content);
+              contentType = ctKeys.join(', ');
+              const firstCt = ctKeys[0];
+              const schemaSummary = firstCt ? summarizeSchema(op.requestBody.content[firstCt]?.schema) : '';
+              requestBody = {
+                contentTypes: ctKeys,
+                required: op.requestBody.required,
+                schemaSummary,
+              };
             }
-            endpoints.push({ path: pathKey, method: method.toUpperCase(), contentType });
+
+            const opParams = Array.isArray(op.parameters) ? op.parameters : [];
+            const allParams = [...sharedParams, ...opParams];
+            const parameters = allParams.map((p: any) => ({
+              name: p.name,
+              in: p.in,
+              required: p.required,
+              type: summarizeSchema(p.schema) || p.type,
+              description: p.description,
+            }));
+
+            const responses = op.responses
+              ? Object.entries(op.responses).map(([code, resp]: [string, any]) => ({
+                  code,
+                  description: resp?.description,
+                  contentTypes: resp?.content ? Object.keys(resp.content) : undefined,
+                }))
+              : undefined;
+
+            const security = Array.isArray(op.security)
+              ? op.security.flatMap((s: any) => Object.keys(s || {}))
+              : undefined;
+
+            endpoints.push({
+              path: pathKey,
+              method: method.toUpperCase(),
+              contentType,
+              summary: op.summary,
+              description: op.description,
+              tags: op.tags,
+              deprecated: op.deprecated,
+              operationId: op.operationId,
+              parameters: parameters.length > 0 ? parameters : undefined,
+              requestBody,
+              responses,
+              security: security && security.length > 0 ? security : undefined,
+            });
           }
         }
 
-        specs.push({ filename: file.filename, fqdn, endpoints });
+        specs.push({
+          filename: file.filename,
+          fqdn,
+          title: spec.info?.title,
+          version: spec.info?.version,
+          description: spec.info?.description,
+          openapi: spec.openapi || spec.swagger,
+          raw: spec,
+          endpoints,
+        });
       } catch {
         // Skip unparseable JSON
       }
@@ -253,6 +408,58 @@ async function handleSwaggerParse(req: IncomingMessage, res: ServerResponse) {
 
   } catch (err: any) {
     console.error('[SwaggerParse] Error:', err.message);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: err.message }));
+  }
+}
+
+/**
+ * Handle raw swagger-zip download — streams the F5 XC swagger_spec ZIP back
+ * to the browser as application/zip so the user can save the original file
+ * (same content as F5 XC console "Download Schema").
+ */
+async function handleSwaggerZip(req: IncomingMessage, res: ServerResponse) {
+  let body = '';
+  for await (const chunk of req) body += chunk;
+
+  try {
+    const { tenant, token, namespace, lbName } = JSON.parse(body);
+    if (!tenant || !token || !namespace || !lbName) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required fields' }));
+      return;
+    }
+
+    const hostname = `${tenant}.console.ves.volterra.io`;
+    const path = `/api/ml/data/namespaces/${namespace}/virtual_hosts/ves-io-http-loadbalancer-${lbName}/api_endpoints/swagger_spec`;
+
+    console.log(`[SwaggerZip] Downloading raw schema for ${lbName} from ${hostname}${path}`);
+
+    const response = await makeF5XCRequestRaw({
+      hostname,
+      path,
+      method: 'GET',
+      headers: {
+        'Authorization': `APIToken ${token}`,
+        'Accept': '*/*',
+      },
+    });
+
+    if (response.statusCode !== 200) {
+      res.writeHead(response.statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `F5 XC returned HTTP ${response.statusCode} — API Discovery may not be enabled for ${lbName}` }));
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Length': response.body.length.toString(),
+      'Content-Disposition': `attachment; filename="${lbName}_swagger_spec.zip"`,
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(response.body);
+  } catch (err: any) {
+    console.error('[SwaggerZip] Error:', err.message);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: err.message }));
   }
@@ -632,13 +839,36 @@ export default defineConfig({
         });
 
         // -------------------------------------------------------------
+        // 2b. Swagger Zip Proxy (raw ZIP download)
+        //     Streams the F5 XC swagger_spec ZIP back to the client so
+        //     it can be saved exactly like the console's "Download Schema"
+        // -------------------------------------------------------------
+        server.middlewares.use('/api/proxy/swagger-zip', (req, res, next) => {
+          if (req.method === 'OPTIONS') {
+            res.writeHead(200, {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Methods': 'POST, OPTIONS',
+              'Access-Control-Allow-Headers': 'Content-Type',
+            });
+            res.end();
+            return;
+          }
+          if (req.method !== 'POST') return next();
+          handleSwaggerZip(req, res);
+        });
+
+        // -------------------------------------------------------------
         // 3. Generic F5 XC Proxy (General Route)
         //    Handles standard API calls for other tools
         // -------------------------------------------------------------
         server.middlewares.use('/api/proxy', (req, res, next) => {
           // IMPORTANT: If the URL matches the specific route above, do NOT process it here.
           // Note: req.originalUrl includes the full path, req.url is relative to mount point
-          if (req.originalUrl && (req.originalUrl.includes('/api/proxy/request') || req.originalUrl.includes('/api/proxy/swagger-parse'))) {
+          if (req.originalUrl && (
+            req.originalUrl.includes('/api/proxy/request') ||
+            req.originalUrl.includes('/api/proxy/swagger-parse') ||
+            req.originalUrl.includes('/api/proxy/swagger-zip')
+          )) {
             return next();
           }
 
@@ -684,6 +914,7 @@ export default defineConfig({
         console.log('\n 🔌 F5 XC API Proxy enabled at /api/proxy');
         console.log(' 🔌 Sanity Checker Proxy enabled at /api/proxy/request');
         console.log(' 🔌 Swagger Parse Proxy enabled at /api/proxy/swagger-parse');
+        console.log(' 🔌 Swagger Zip Proxy enabled at /api/proxy/swagger-zip');
         console.log(' 🔌 Load Tester Proxy enabled at /api/load-test\n');
       },
     },

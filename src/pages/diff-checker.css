@@ -1,0 +1,16 @@
+.diff-char-add {
+  background-color: rgba(34, 197, 94, 0.4);
+  border-radius: 2px;
+}
+
+.diff-char-del {
+  background-color: rgba(239, 68, 68, 0.4);
+  border-radius: 2px;
+  text-decoration: line-through;
+  text-decoration-color: rgba(239, 68, 68, 0.6);
+}
+
+.hljs {
+  background: transparent !important;
+  padding: 0 !important;
+}

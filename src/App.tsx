@@ -27,6 +27,8 @@ import { SOCLobby } from './pages/SOCLobby';
 import { SOCRoom } from './pages/SOCRoom';
 import { APIShieldAdvisor } from './pages/APIShieldAdvisor';
 import { APIReport } from './pages/APIReport';
+import { Anonymizer } from './pages/Anonymizer';
+import { DiffChecker } from './pages/DiffChecker';
 import {
   WAFScannerExplainer, SecurityAuditorExplainer, FPAnalyzerExplainer,
   DDoSAdvisorExplainer, ConfigViewerExplainer, ConfigComparatorExplainer,
@@ -70,6 +72,8 @@ function App() {
                 <Route path="/soc-room/:roomId" element={<SOCRoom />} />
                 <Route path="/api-shield" element={<APIShieldAdvisor />} />
                 <Route path="/api-report" element={<APIReport />} />
+                <Route path="/anonymizer" element={<Anonymizer />} />
+                <Route path="/diff-checker" element={<DiffChecker />} />
                 {/* Tool Explainer Pages */}
                 <Route path="/explainer/waf-scanner" element={<WAFScannerExplainer />} />
                 <Route path="/explainer/security-auditor" element={<SecurityAuditorExplainer />} />
