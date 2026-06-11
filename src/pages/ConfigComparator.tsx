@@ -2,14 +2,14 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ArrowLeft, ArrowRight, ArrowRightLeft, Check, Search, Server, Shield,
-  Globe, AlertTriangle, Loader2, Split, Database, LayoutList, X, Play,
-  Key, Layers, Eye, EyeOff, CheckCircle, FolderOpen, Cloud,
-  FileJson, Users, Activity, Code, Filter, ChevronDown, ChevronRight, Zap, HelpCircle
+  Globe, Loader2, Split, Database, LayoutList, X, Play,
+  Key, Eye, CheckCircle, Cloud,
+  FileJson, Activity, Code, Filter, ChevronRight, Zap, HelpCircle
 } from 'lucide-react';
 import { apiClient } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
-import type { Namespace, LoadBalancer } from '../types';
+import type { Namespace } from '../types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -111,7 +111,7 @@ export function ConfigComparator() {
 
   const [namespaces, setNamespaces] = useState<Namespace[]>([]);
   const [destNamespaces, setDestNamespaces] = useState<Namespace[]>([]);
-  const [isLoadingNs, setIsLoadingNs] = useState(false);
+  const [, setIsLoadingNs] = useState(false);
   
   // Dest Tenant Validation
   const [showDestToken, setShowDestToken] = useState(false);
@@ -241,11 +241,23 @@ export function ConfigComparator() {
       const destHttpPath = `/api/config/namespaces/${config.destNs}/http_loadbalancers`;
       const destCdnPath = `/api/config/namespaces/${config.destNs}/cdn_loadbalancers`;
 
+      // The bare list API returns only name/uid/labels (no spec), so drift can't
+      // be detected from it. Request `?report_fields` to get each item's get_spec;
+      // fall back to the plain list if a tenant rejects the parameter so the
+      // overview still populates.
+      const fetchList = async (path: string, fetcher: (p: string) => Promise<any>) => {
+        try {
+          const withSpec = await fetcher(`${path}?report_fields`);
+          if (withSpec && Array.isArray((withSpec as any).items)) return withSpec;
+        } catch { /* fall back to bare list below */ }
+        return fetcher(path).catch(() => ({ items: [] }));
+      };
+
       const [srcHttp, srcCdn, destHttp, destCdn] = await Promise.all([
-        fetchFromSource(srcHttpPath).catch(() => ({ items: [] })),
-        fetchFromSource(srcCdnPath).catch(() => ({ items: [] })),
-        fetchFromDest(destHttpPath).catch(() => ({ items: [] })),
-        fetchFromDest(destCdnPath).catch(() => ({ items: [] })),
+        fetchList(srcHttpPath, fetchFromSource),
+        fetchList(srcCdnPath, fetchFromSource),
+        fetchList(destHttpPath, fetchFromDest),
+        fetchList(destCdnPath, fetchFromDest),
       ]);
 
       const map = new Map<string, OverviewItem>();
@@ -265,8 +277,10 @@ export function ConfigComparator() {
             const entry = map.get(key)!;
             entry[isSource ? 'sourceObj' : 'destObj'] = item;
             if (entry.sourceObj && entry.destObj) {
-              const srcD = entry.sourceObj.spec?.domains?.sort().join(',') || '';
-              const destD = entry.destObj.spec?.domains?.sort().join(',') || '';
+              const srcSpec = entry.sourceObj.get_spec || entry.sourceObj.spec;
+              const destSpec = entry.destObj.get_spec || entry.destObj.spec;
+              const srcD = [...(srcSpec?.domains || [])].sort().join(',');
+              const destD = [...(destSpec?.domains || [])].sort().join(',');
               entry.status = 'match';
               entry.domainsMatch = srcD === destD;
             }

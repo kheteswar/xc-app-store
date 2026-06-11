@@ -19,6 +19,7 @@ import type { QuickModeSignalsInput, ComputeSignalsInput } from '../src/services
 import { computeQuickVerdict, mapToRecord } from '../src/services/fp-analyzer/signal-calculator';
 import { classifyMatchingInfo } from '../src/services/fp-analyzer/matching-info-analyzer';
 import { generateSignatureExclusion, generateViolationExclusion, buildWafExclusionPolicy, groupExclusionRules } from '../src/services/fp-analyzer/exclusion-generator';
+import { parseContext } from '../src/services/fp-analyzer/context-parser';
 import { AnalysisLogger } from '../src/services/fp-analyzer/analysis-logger';
 import type {
   AnalysisScope,
@@ -268,6 +269,21 @@ function getSignatures(event: RawEvent): Array<{
     matchingInfo: String(s.matching_info || ''),
     state: String(s.state || ''),
   }));
+}
+
+/**
+ * XC security events carry signature context as a display string like
+ * "parameter (q)"; the structured context_type/context_name fields are
+ * almost always absent. WAF exclusion rules, however, require a CONTEXT_*
+ * enum and a bare context name. Prefer XC's structured fields when present,
+ * otherwise parse the human-readable string into the enum + name.
+ */
+function normalizeSignatureContext(sig: { context: string; contextName: string; contextType: string }): { contextType: string; contextName: string } {
+  if (sig.contextType && sig.contextType.startsWith('CONTEXT_')) {
+    return { contextType: sig.contextType, contextName: sig.contextName || '' };
+  }
+  const parsed = parseContext(sig.context || sig.contextType || '');
+  return { contextType: parsed.contextType, contextName: sig.contextName || parsed.contextName };
 }
 
 function getViolations(event: RawEvent): Array<{
@@ -695,8 +711,9 @@ export class ProgressiveAnalysisJob {
             sigName = sig.name;
             accuracy = sig.accuracy;
             attackType = sig.attackType;
-            contextType = sig.contextType || sig.context;
-            contextName = sig.contextName;
+            const ctx = normalizeSignatureContext(sig);
+            contextType = ctx.contextType;
+            contextName = ctx.contextName;
             sigState = sig.state;
             if (sig.state === 'AutoSuppressed') autoSuppressed = true;
           }
@@ -1035,8 +1052,9 @@ export class ProgressiveAnalysisJob {
           sigName = sig.name;
           accuracy = sig.accuracy;
           attackType = sig.attackType;
-          contextType = sig.contextType || sig.context;
-          contextName = sig.contextName;
+          const ctx = normalizeSignatureContext(sig);
+          contextType = ctx.contextType;
+          contextName = ctx.contextName;
           contextRaw = sig.context;
           sigState = sig.state;
           if (sig.state === 'AutoSuppressed') autoSuppressed = true;

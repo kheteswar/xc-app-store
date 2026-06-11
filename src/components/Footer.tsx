@@ -1,5 +1,3 @@
-import React from 'react';
-
 export function Footer() {
   return (
     <footer className="border-t border-slate-800 pt-6 pb-12">

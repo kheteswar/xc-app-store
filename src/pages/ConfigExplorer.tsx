@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
   GitBranch, Search, Loader2, AlertCircle, ArrowLeft,
-  Package, ChevronRight, ChevronDown, XCircle, Filter,
+  Package, ChevronRight, ChevronDown, XCircle,
   Table2, Network, TreePine, Grid3X3, Download, HelpCircle,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -11,7 +11,7 @@ import { apiClient } from '../services/api';
 import {
   OBJECT_TYPES, OBJECT_CATEGORIES,
   listObjects, fetchObjectWithChildren,
-  buildRelationshipGraph, clearCache, getTypeColor, TYPE_COLORS,
+  buildRelationshipGraph, clearCache, getTypeColor,
 } from '../services/config-dump';
 import type { ObjectTypeDefinition, FetchedObject, DumpProgress, RelationshipGraphData, GraphNode, GraphEdge } from '../services/config-dump';
 import { RelationshipGraph } from '../components/config-dump/RelationshipGraph';
@@ -178,55 +178,6 @@ function DependencyTable({ data }: { data: RelationshipGraphData }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // VIEW: HIERARCHY TREE
 // ═══════════════════════════════════════════════════════════════════════════
-
-function HierarchyTreeNode({ obj, depth = 0 }: { obj: FetchedObject; depth?: number }) {
-  const [expanded, setExpanded] = useState(depth < 2);
-  const hasChildren = obj.children.some(cg => cg.objects.length > 0);
-
-  return (
-    <div style={{ marginLeft: depth > 0 ? 20 : 0 }}>
-      <div
-        className="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-700/30 rounded-lg cursor-pointer group transition-colors"
-        onClick={() => setExpanded(!expanded)}
-      >
-        {hasChildren ? (
-          expanded ? <ChevronDown className="w-3.5 h-3.5 text-slate-500" /> : <ChevronRight className="w-3.5 h-3.5 text-slate-500" />
-        ) : (
-          <div className="w-3.5 h-3.5" />
-        )}
-        <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: getTypeColor(obj.type) }} />
-        <span className="text-sm font-medium text-slate-200">{obj.name}</span>
-        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium" style={{ backgroundColor: getTypeColor(obj.type) + '20', color: getTypeColor(obj.type) }}>
-          {obj.type.replace(/_/g, ' ')}
-        </span>
-        {obj.namespace && <span className="text-[10px] text-slate-600">{obj.namespace}</span>}
-        {hasChildren && (
-          <span className="text-[10px] text-slate-600 ml-auto">
-            {obj.children.reduce((sum, cg) => sum + cg.objects.length, 0)} child{obj.children.reduce((sum, cg) => sum + cg.objects.length, 0) !== 1 ? 'ren' : ''}
-          </span>
-        )}
-      </div>
-
-      {expanded && hasChildren && (
-        <div className="border-l border-slate-700/50 ml-[17px]">
-          {obj.children.map((cg, i) => {
-            if (cg.objects.length === 0) return null;
-            return (
-              <div key={i}>
-                <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-3 py-1 mt-1">
-                  {cg.label} ({cg.objects.length})
-                </div>
-                {cg.objects.map((child, j) => (
-                  <HierarchyTreeNode key={j} obj={child} depth={depth + 1} />
-                ))}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
 
 function HierarchyTree({ results }: { results: FetchedObject[] }) {
   const [expandAll, setExpandAll] = useState(false);

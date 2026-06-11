@@ -8,11 +8,11 @@ import type {
   SOCRoomConfig, SOCAction, HeartbeatResult, AggregationResults,
   AlertEntry, AuditEntry, LatencyStats, EventFeedEntry, JA4Cluster,
   BotTrafficOverview, SyntheticHealthSummary, DNSHealthStatus,
-  PollingCycleResult, EMPTY_AGGREGATION,
+  PollingCycleResult,
 } from './types';
 import { createEmptyLatencyStats } from './types';
 import { buildAccessLogAggregations, buildSecurityEventAggregations, buildLBQuery } from './aggregation-builder';
-import { parseAggregationResponse, calculateMetrics } from './metrics-calculator';
+import { parseAggregationResponse } from './metrics-calculator';
 import { processRawLogs } from './raw-log-processor';
 import { fetchActiveAlerts } from './alert-fetcher';
 import { fetchRecentChanges } from './config-change-tracker';

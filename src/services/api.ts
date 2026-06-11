@@ -163,8 +163,17 @@ class F5XCApiClient {
     return this.get(`/api/config/namespaces/${namespace}/app_firewalls`);
   }
 
+  async getWAFPolicy(namespace: string, name: string): Promise<WAFPolicy> {
+    return this.get(`/api/config/namespaces/${namespace}/app_firewalls/${name}`);
+  }
+
   async createAppFirewall(namespace: string, body: unknown): Promise<any> {
     return this.post(`/api/config/namespaces/${namespace}/app_firewalls`, body);
+  }
+
+  // --- Health Check APIs ---
+  async getHealthCheck(namespace: string, name: string): Promise<unknown> {
+    return this.get(`/api/config/namespaces/${namespace}/healthchecks/${name}`);
   }
 
   // --- Origin Pool APIs ---
@@ -185,6 +194,10 @@ class F5XCApiClient {
     return this.get(`/api/config/namespaces/${namespace}/app_types`);
   }
 
+  async getAppType(name: string): Promise<AppType> {
+    return this.get(`/api/config/namespaces/shared/app_types/${name}`);
+  }
+
   // --- App Settings APIs ---
   async getAppSettings(namespace: string): Promise<{ items: AppSetting[] }> {
     return this.get(`/api/config/namespaces/${namespace}/app_settings`);
@@ -195,9 +208,17 @@ class F5XCApiClient {
     return this.get(`/api/config/namespaces/${namespace}/virtual_sites`);
   }
 
+  async getVirtualSite(namespace: string, name: string): Promise<VirtualSite> {
+    return this.get(`/api/config/namespaces/${namespace}/virtual_sites/${name}`);
+  }
+
   // --- User Identification APIs ---
   async getUserIdentificationPolicies(namespace: string): Promise<{ items: UserIdentificationPolicy[] }> {
     return this.get(`/api/config/namespaces/${namespace}/user_identification_policys`);
+  }
+
+  async getUserIdentificationPolicy(namespace: string, name: string): Promise<UserIdentificationPolicy> {
+    return this.get(`/api/config/namespaces/${namespace}/user_identifications/${name}`);
   }
 
   // --- CDN APIs ---

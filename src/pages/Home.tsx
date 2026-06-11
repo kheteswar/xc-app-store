@@ -1,6 +1,5 @@
 import { useState, useCallback } from 'react';
 import {
-  Wrench,
   Globe,
   Grid3X3,
   RefreshCcw,

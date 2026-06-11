@@ -3,33 +3,15 @@
 // Exports all security rules for the audit engine
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { tlsSslRules } from './tls-ssl.rules';
-import { wafRules } from './waf.rules';
-import { originRules } from './origin.rules';
-import { botDdosRules } from './bot-ddos.rules';
-import { accessControlRules } from './access-control.rules';
-import { loggingRules } from './logging.rules';
+import { catalogRules } from './catalog.rules';
 import type { SecurityRule } from '../types';
 
-// Combine all rules
-export const allRules: SecurityRule[] = [
-  ...tlsSslRules,
-  ...wafRules,
-  ...originRules,
-  ...botDdosRules,
-  ...accessControlRules,
-  ...loggingRules,
-];
+// The consolidated, field-accurate catalog is the single source of truth.
+// (The earlier per-domain rule files read incorrect XC field paths and have
+// been superseded by catalog.rules.ts + xc-extractors.ts.)
+export const allRules: SecurityRule[] = [...catalogRules];
 
-// Export individual rule sets for selective use
-export {
-  tlsSslRules,
-  wafRules,
-  originRules,
-  botDdosRules,
-  accessControlRules,
-  loggingRules,
-};
+export { catalogRules };
 
 // Get rules by category
 export const getRulesByCategory = (category: string): SecurityRule[] => {

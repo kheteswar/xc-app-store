@@ -15,11 +15,6 @@ function safeStr(val: unknown, fallback = ''): string {
   return typeof val === 'string' ? val : fallback;
 }
 
-function safeNum(val: unknown, fallback = 0): number {
-  const n = Number(val);
-  return isNaN(n) ? fallback : n;
-}
-
 // ---------------------------------------------------------------------------
 // Empty result — returned when CSD is not enabled or API fails
 // ---------------------------------------------------------------------------

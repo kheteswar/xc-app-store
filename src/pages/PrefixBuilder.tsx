@@ -20,8 +20,6 @@ import {
   Tag,
   AlertTriangle,
   Lock,
-  Globe,
-  Settings,
   HelpCircle
 } from 'lucide-react';
 import type { ServicePolicy } from '../types';

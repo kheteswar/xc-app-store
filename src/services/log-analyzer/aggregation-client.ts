@@ -269,7 +269,7 @@ export async function scanHourlyVolume(
   const queue = [...buckets.keys()];
   const active = new Set<number>();
 
-  await new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolve, _reject) => {
     function dispatch() {
       while (active.size < CONCURRENCY && queue.length > 0) {
         const idx = queue.shift()!;

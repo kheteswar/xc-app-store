@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -248,7 +248,7 @@ export function CopyConfig() {
     setStep(3);
   };
 
-  const prepareCreatePayload = (original: AlertReceiver | AlertPolicy, destNamespace: string, destTenantName?: string): unknown => {
+  const prepareCreatePayload = (original: AlertReceiver | AlertPolicy | CDNCacheRule, destNamespace: string, _destTenantName?: string): unknown => {
     // Deep clone the original object
     const source: Record<string, unknown> = JSON.parse(JSON.stringify(original));
 
@@ -431,10 +431,6 @@ export function CopyConfig() {
       return destValidated && selectedSourceNs;
     }
     return selectedSourceNs;
-  };
-
-  const canProceedToStep3 = () => {
-    return selectedObjects.length > 0 && selectedDestNs;
   };
 
   return (

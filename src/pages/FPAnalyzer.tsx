@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import {
   ShieldAlert, Play, ChevronDown, ChevronRight, AlertTriangle,
   Globe, Target, Lock, Check, XCircle,
-  ArrowLeft, ArrowRight, Zap, Search, BarChart3,
+  ArrowLeft, ArrowRight, Zap, BarChart3,
   Download, FileSpreadsheet, HelpCircle,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';

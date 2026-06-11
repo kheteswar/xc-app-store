@@ -7,7 +7,6 @@ import {
   ChevronRight,
   Check,
   Loader2,
-  Download,
   FileJson,
   Table,
   Eye,
@@ -42,7 +41,7 @@ export function WAFScanner() {
   const [includeRoutes, setIncludeRoutes] = useState(true);
   const [isLoadingNs, setIsLoadingNs] = useState(true);
 
-  const [isScanning, setIsScanning] = useState(false);
+  const [, setIsScanning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState('');
   const [operation, setOperation] = useState({ title: '', subtitle: '' });
@@ -124,6 +123,8 @@ export function WAFScanner() {
       if (m === 'MONITORING') return 'monitoring';
     }
     if (waf.spec.blocking) return 'blocking';
+    // AI risk-based blocking is an active blocking enforcement posture (newer XC oneof member)
+    if (waf.spec.ai_risk_based_blocking) return 'blocking';
     if (waf.spec.monitoring) return 'monitoring';
     return 'unknown';
   };

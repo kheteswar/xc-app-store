@@ -101,7 +101,7 @@ const isIpAddress = (val: string): boolean => {
 };
 
 export function HttpLbForge() {
-  const { showToast } = useToast();
+  const toast = useToast();
   
   // State
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
@@ -110,8 +110,7 @@ export function HttpLbForge() {
   const [csvData, setCsvData] = useState<CsvRow[]>([]);
   const [validationResults, setValidationResults] = useState<ValidationResult[]>([]);
   const [creationResults, setCreationResults] = useState<CreationResult[]>([]);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [certificates, setCertificates] = useState<Certificate[]>([]);
+  const [, setCertificates] = useState<Certificate[]>([]);
   
   // UI
   const [isLoading, setIsLoading] = useState(false);
@@ -172,7 +171,7 @@ export function HttpLbForge() {
           }
           setCertificates(allCerts);
         } catch (err) {
-          showToast('Failed to fetch certificates', 'error');
+          toast.error('Failed to fetch certificates');
           console.error(err);
         }
       }
@@ -292,10 +291,9 @@ export function HttpLbForge() {
       setCreationResults(prev => [...prev, { name: item.row.name, status: 'pending', step: 'pool' }]);
 
       if (!item.isValid) {
-        setCreationResults(prev => [
-          ...prev.filter(r => r.name !== item.row.name),
-          { name: item.row.name, status: 'error', details: item.message }
-        ]);
+        const result: CreationResult = { name: item.row.name, status: 'error', details: item.message };
+        results.push(result);
+        setCreationResults(prev => [...prev.filter(r => r.name !== item.row.name), result]);
         continue;
       }
 
@@ -323,22 +321,20 @@ export function HttpLbForge() {
         // --- Phase 3: Create Load Balancer ---
         await createSingleLb(item, poolName, wafName);
         
-        setCreationResults(prev => [
-          ...prev.filter(r => r.name !== item.row.name),
-          { name: item.row.name, status: 'success', step: 'done', details: 'Created successfully' }
-        ]);
+        const result: CreationResult = { name: item.row.name, status: 'success', step: 'done', details: 'Created successfully' };
+        results.push(result);
+        setCreationResults(prev => [...prev.filter(r => r.name !== item.row.name), result]);
       } catch (error: any) {
-        setCreationResults(prev => [
-          ...prev.filter(r => r.name !== item.row.name),
-          { name: item.row.name, status: 'error', details: error.message || 'Unknown error' }
-        ]);
+        const result: CreationResult = { name: item.row.name, status: 'error', details: error.message || 'Unknown error' };
+        results.push(result);
+        setCreationResults(prev => [...prev.filter(r => r.name !== item.row.name), result]);
       }
 
       await new Promise(resolve => setTimeout(resolve, 500));
     }
 
     setStep(4);
-    fetchFinalDetails();
+    fetchFinalDetails(results);
   };
 
   const createOriginPool = async (item: ValidationResult, poolName: string, port: number) => {
@@ -353,12 +349,26 @@ export function HttpLbForge() {
       spec: {
         origin_servers: [
             {
-                [isIp ? 'public_ip' : 'public_name']: isIp 
-                    ? { ip: row.origin } 
+                [isIp ? 'public_ip' : 'public_name']: isIp
+                    ? { ip: row.origin }
                     : { dns_name: row.origin }
             }
         ],
         port: port,
+        // Origin pools require an explicit TLS choice. Port 443 implies the
+        // origin speaks TLS; otherwise connect in plaintext. (For a 443 origin
+        // with a private/self-signed cert, switch to use_server_verification or
+        // volterra_trusted_ca after creation.)
+        ...(port === 443
+          ? {
+              use_tls: {
+                use_host_header_as_sni: {},
+                tls_config: { default_security: {} },
+                skip_server_verification: {},
+                no_mtls: {},
+              },
+            }
+          : { no_tls: {} }),
         loadbalancer_algorithm: "LB_OVERRIDE",
         endpoint_selection: "DISTRIBUTED"
       }
@@ -374,14 +384,15 @@ export function HttpLbForge() {
             namespace: item.row.namespace,
             disable: false
         },
+        // app_firewall object spec: enforcement mode + settings live at the spec
+        // root (not nested under `app_firewall`). `blocking`/`monitoring` are a
+        // mutually-exclusive oneof — `use_loadbalancer_setting` is a route-level
+        // WAF choice, not valid here, so it must not be set alongside `blocking`.
         spec: {
-            app_firewall: {
-                default_detection_settings: {},
-                default_bot_setting: {},
-                default_anonymization: {},
-                use_loadbalancer_setting: {},
-                blocking: {}
-            }
+            blocking: {},
+            default_detection_settings: {},
+            default_bot_setting: {},
+            default_anonymization: {}
         }
     };
     return apiClient.createAppFirewall(item.row.namespace, payload);
@@ -393,17 +404,17 @@ export function HttpLbForge() {
     // UPDATED: Use simple_route wrapper correctly
     const routes = parsedDomains.map(domain => ({
         simple_route: {
-            match: {
-                path: {
-                    prefix: "/"
-                },
-                headers: [
-                    {
-                        name: "Host",
-                        exact: domain
-                    }
-                ]
+            // XC RouteTypeSimple carries path/headers/origin_pools at the top
+            // level — there is no `match` wrapper.
+            path: {
+                prefix: "/"
             },
+            headers: [
+                {
+                    name: "Host",
+                    exact: domain
+                }
+            ],
             origin_pools: [
                 {
                     pool: {
@@ -466,11 +477,14 @@ export function HttpLbForge() {
 
   // --- Step 4: Reporting ---
 
-  const fetchFinalDetails = async () => {
+  const fetchFinalDetails = async (baseResults: CreationResult[]) => {
     setIsLoading(true);
     setLoadingText('Fetching DNS & VIP details for report...');
-    
-    const enhancedResults = [...creationResults];
+
+    // Use the outcomes accumulated during creation, not `creationResults` from
+    // the click-time closure (which is stale because the per-item updates used
+    // the functional setState form and never rebind this variable).
+    const enhancedResults = [...baseResults];
 
     for (let i = 0; i < enhancedResults.length; i++) {
       if (enhancedResults[i].status !== 'success') continue;

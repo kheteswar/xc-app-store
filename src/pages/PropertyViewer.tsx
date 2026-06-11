@@ -5,6 +5,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { MouseEvent as ReactMouseEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Layers, Loader2, Check, Search, FileJson, Table, Play, X,
@@ -922,7 +923,7 @@ export function PropertyViewer() {
                           {selectedPropertyDefs.map(p => (
                             <div key={p.id}>
                               <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1.5 font-medium">{p.label}</div>
-                              <ValueBadge value={row.values[p.id] || 'N/A'} onClick={(e) => e?.stopPropagation()} />
+                              <ValueBadge value={row.values[p.id] || 'N/A'} onClick={(e?: ReactMouseEvent) => e?.stopPropagation()} />
                             </div>
                           ))}
                         </div>

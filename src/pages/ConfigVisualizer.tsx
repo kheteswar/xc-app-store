@@ -34,7 +34,6 @@ import {
   ArrowRight,
   Timer,
   Hash,
-  Link as LinkIcon,
   ShieldCheck,
   ShieldAlert,
   ShieldOff,
@@ -47,7 +46,7 @@ import {
 import { apiClient } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
-import type { Namespace, LoadBalancer, CDNLoadBalancer, CDNCacheRule, ParsedRoute, OriginPool, WAFPolicy, HealthCheck, ServicePolicy, ServicePolicyRule, AppType, AppSetting, AppTypeSetting, VirtualSite, UserIdentificationPolicy } from '../types';
+import type { Namespace, LoadBalancer, CDNLoadBalancer, CDNCacheRule, ParsedRoute, OriginPool, WAFPolicy, HealthCheck, ServicePolicy, ServicePolicyRule, AppType, AppSetting, AppTypeSetting, VirtualSite, UserIdentificationPolicy, Certificate } from '../types';
 
 import { parseCertificateUrl } from '../utils/certParser';
 
@@ -204,7 +203,7 @@ export function ConfigVisualizer() {
     });
   };
 
-  const parseRoute = (route: LoadBalancer['spec']['routes'][0], index: number): ParsedRoute => {
+  const parseRoute = (route: NonNullable<NonNullable<LoadBalancer['spec']>['routes']>[number], index: number): ParsedRoute => {
     const parsed: ParsedRoute = {
       index,
       type: 'unknown',
@@ -279,7 +278,7 @@ export function ConfigVisualizer() {
         };
       }
       parsed.headerMatchers = sr.headers;
-      parsed.queryParams = sr.query_params;
+      parsed.queryParams = sr.query_params as unknown as unknown[];
     } else if (route.redirect_route) {
       parsed.type = 'redirect';
       const rr = route.redirect_route;
@@ -426,10 +425,10 @@ export function ConfigVisualizer() {
           const [certNs, certName] = refKey.split('/');
           
 
-          const res = await apiClient.get(`/api/config/namespaces/${certNs}/certificates/${certName}`);
+          const res = await apiClient.get<{ spec?: unknown; data?: Certificate }>(`/api/config/namespaces/${certNs}/certificates/${certName}`);
 
           // The API returns the certificate object directly, not wrapped in .data
-          const certData = res?.spec ? res : res?.data;
+          const certData = (res?.spec ? res : res?.data) as Certificate | undefined;
           
           if (certData?.spec?.certificate_url) {
             state.certificates.set(refKey, certData);
@@ -521,7 +520,7 @@ export function ConfigVisualizer() {
     }
   };
 
-  const fetchOriginPools = async (refs: Set<string>, state: ViewerState, currentNs: string) => {
+  const fetchOriginPools = async (refs: Set<string>, state: ViewerState, _currentNs: string) => {
       for (const ref of refs) {
           const [ns, name] = ref.split('/');
           if (state.originPools.has(name)) continue;
@@ -637,23 +636,6 @@ export function ConfigVisualizer() {
   };
 
   const lb = state.rootLB;
-  const spec = lb?.spec;
-
-  let lbType = 'HTTP';
-  let lbTypeClass = 'bg-slate-600';
-  if (spec?.https_auto_cert) {
-    lbType = 'HTTPS (Auto Cert)';
-    lbTypeClass = 'bg-emerald-600';
-  } else if (spec?.https) {
-    lbType = 'HTTPS (Custom)';
-    lbTypeClass = 'bg-blue-600';
-  }
-
-  let advertiseType = 'Unknown';
-  if (spec?.advertise_on_public_default_vip) advertiseType = 'Public (Default VIP)';
-  else if (spec?.advertise_on_public) advertiseType = 'Public (Custom)';
-  else if (spec?.advertise_custom) advertiseType = 'Custom';
-  else if (spec?.do_not_advertise) advertiseType = 'Not Advertised';
 
   const getRouteTypeLabel = (type: string) => {
     const labels: Record<string, { text: string; color: string }> = {
@@ -675,20 +657,6 @@ export function ConfigVisualizer() {
   };
 
   // Helper for HTTP method colors (required for the Routes section)
-  const getMethodColor = (method: string) => {
-    const colors: Record<string, string> = {
-      GET: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
-      POST: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
-      PUT: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
-      DELETE: 'bg-red-500/15 text-red-400 border-red-500/30',
-      PATCH: 'bg-violet-500/15 text-violet-400 border-violet-500/30',
-      HEAD: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30',
-      OPTIONS: 'bg-slate-500/15 text-slate-400 border-slate-500/30',
-      ANY: 'bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/30',
-    };
-    return colors[method] || 'bg-slate-500/15 text-slate-400';
-  };
-
   const renderHTTPLBContent = () => {
     const lb = state.rootLB!;
     const spec = lb.spec as any;
@@ -1196,7 +1164,7 @@ export function ConfigVisualizer() {
           const appTypeSpec = state.appType.spec || state.appType.get_spec;
           const appTypeName = state.appType.metadata?.name || state.appType.name || 'Unknown';
           const appTypeNs = state.appType.metadata?.namespace || state.appType.namespace || 'shared';
-          const appTypeDisabled = state.appType.metadata?.disable || state.appType.disabled;
+          const appTypeDisabled = state.appType.metadata?.disable || (state.appType as { disabled?: boolean }).disabled;
           return (
             <section className="bg-slate-800/50 border border-slate-700 rounded-xl">
               <button
@@ -1929,13 +1897,13 @@ export function ConfigVisualizer() {
                               <span className="text-slate-300 text-sm">{r.queryParams.length} rule(s)</span>
                             </div>
                           )}
-                          {r.corsPolicy && (
+                          {!!r.corsPolicy && (
                             <div>
                               <span className="text-xs text-slate-500 block mb-1">CORS Policy</span>
                               <span className="text-emerald-400 text-sm">Configured</span>
                             </div>
                           )}
-                          {r.retries && (
+                          {!!r.retries && (
                             <div>
                               <span className="text-xs text-slate-500 block mb-1">Retry Policy</span>
                               <span className="text-emerald-400 text-sm">Configured</span>
@@ -2014,7 +1982,7 @@ export function ConfigVisualizer() {
                                 <span className="text-slate-300 text-sm">{r.advancedOptions.responseCookies}</span>
                               </div>
                             )}
-                            {r.advancedOptions.botDefense && (
+                            {!!r.advancedOptions.botDefense && (
                               <div>
                                 <span className="text-xs text-slate-500 block">Bot Defense JS</span>
                                 <span className="text-emerald-400 text-sm">Inherited</span>
@@ -2051,7 +2019,6 @@ export function ConfigVisualizer() {
             <div className="p-6 space-y-4">
               {Array.from(state.originPools.entries()).map(([name, pool]) => {
                 const poolSpec = pool.spec;
-                const originCount = poolSpec?.origin_servers?.length || 0;
 
                 let originType = 'Unknown';
                 const originDetails: Array<{ value: string; labels?: Record<string, string> }> = [];
@@ -3833,7 +3800,7 @@ export function ConfigVisualizer() {
                                  <div className="space-y-4">
                                     {[...(spec.custom_cache_rule?.cdn_cache_rules || []), ...(spec.cdn_settings?.cache_rules || [])].map((ref: any, idx: number) => {
                                         const ruleDetail = state.cacheRules.get(ref.name);
-                                        const ruleSpec = ruleDetail?.spec?.cache_rules; 
+                                        const ruleSpec = (ruleDetail?.spec as { cache_rules?: any })?.cache_rules;
                                         
                                         // 1. Determine Action
                                         const isBypass = ruleSpec?.cache_bypass;
@@ -4403,40 +4370,6 @@ function DetailItem({
     <div>
       <span className={`text-slate-500 block ${small ? 'text-xs mb-0.5' : 'text-xs mb-1'}`}>{label}</span>
       <span className={`${valueColor} ${small ? 'text-sm' : ''}`}>{value}</span>
-    </div>
-  );
-}
-
-function SecurityFeatureCard({
-  icon: Icon,
-  name,
-  enabled,
-  value,
-  details,
-}: {
-  icon: typeof Shield;
-  name: string;
-  enabled: boolean;
-  value: string;
-  details?: string;
-}) {
-  return (
-    <div className={`p-4 rounded-xl border ${enabled ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-slate-700/30 border-slate-700'}`}>
-      <div className="flex items-start gap-3 mb-2">
-        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${enabled ? 'bg-emerald-500/15 text-emerald-400' : 'bg-slate-700 text-slate-500'}`}>
-          <Icon className="w-4 h-4" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-medium text-slate-300">{name}</h3>
-          <div className="flex items-center gap-2 mt-1">
-            <span className={`w-2 h-2 rounded-full ${enabled ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-            <span className={`text-sm truncate ${enabled ? 'text-slate-200' : 'text-slate-500'}`}>{value}</span>
-          </div>
-          {details && (
-            <span className="text-xs text-slate-500 mt-1 block">{details}</span>
-          )}
-        </div>
-      </div>
     </div>
   );
 }

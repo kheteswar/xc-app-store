@@ -1,4 +1,4 @@
-import type { RateStats, AlgorithmResult, ImpactSimulation, TimeGranularity, UserMetadata, UserReputationType } from './types';
+import type { RateStats, AlgorithmResult, ImpactSimulation, TimeGranularity, UserMetadata } from './types';
 
 const MAX_RATE_LIMIT = 8192;
 

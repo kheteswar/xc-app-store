@@ -1,3 +1,4 @@
+import type { HookData } from 'jspdf-autotable';
 import type { AccessLogEntry } from '../rate-limit-advisor/types';
 import type { BreakdownResult } from './types';
 
@@ -150,7 +151,7 @@ export async function exportBreakdownAsPDF(bd: BreakdownResult, filename: string
         2: { cellWidth: colWidth * 0.4, halign: 'right' },
       },
       margin: { left: 10, right: 10 },
-      didDrawPage: (data: { cursor?: { y: number } }) => {
+      didDrawPage: (_data: HookData) => {
         // Footer on each page
         doc.setFontSize(7);
         doc.setTextColor(160);

@@ -975,7 +975,6 @@ export function buildStatusTimeSeriesFromAgg(
   if (timeSeries.length === 0) return [];
 
   // Compute overall error/success ratio from aggregations
-  const total = timeSeries.reduce((s, b) => s + b.count, 0) || 1;
   const errorBuckets = (accessAggs['rsp_code_class'] ?? []).filter(b => b.key === '4xx' || b.key === '5xx');
   const errorTotal = errorBuckets.reduce((s, b) => s + b.count, 0);
   const errRatio = errorTotal / (data.totalHits || 1);

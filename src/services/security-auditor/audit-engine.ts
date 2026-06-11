@@ -5,6 +5,7 @@
 
 import { apiClient } from '../api';
 import { allRules } from './rules';
+import { severityToRisk } from './types';
 import type {
   SecurityRule,
   AuditContext,
@@ -16,7 +17,10 @@ import type {
   ConfigSnapshot,
   ConfigObjectType,
   Severity,
-  RuleCategory,
+  EntitlementSummary,
+  NamespaceSummary,
+  LoadBalancerSummary,
+  ScopeSummary,
 } from './types';
 
 // Helper to safely get metadata from object
@@ -24,6 +28,31 @@ const getMetadata = (obj: unknown): Record<string, unknown> => {
   const o = obj as Record<string, unknown>;
   return (o?.metadata || {}) as Record<string, unknown>;
 };
+
+// Relative weight of each severity for the weighted security score.
+const SEVERITY_WEIGHT: Record<Severity, number> = {
+  CRITICAL: 5,
+  HIGH: 4,
+  MEDIUM: 2,
+  LOW: 1,
+  INFO: 0.5,
+};
+
+// Severity-weighted score: PASS earns full weight, WARN half, FAIL zero;
+// SKIP/ERROR are excluded entirely. Returns 0-100 (100 = all relevant checks pass).
+function weightedScore(items: AuditFinding[]): number {
+  let num = 0;
+  let den = 0;
+  for (const f of items) {
+    // SKIP/ERROR/INFO are excluded from the score (INFO = "confirm intent").
+    if (f.status === 'SKIP' || f.status === 'ERROR' || f.status === 'INFO') continue;
+    const w = SEVERITY_WEIGHT[f.severity] ?? 1;
+    den += w;
+    if (f.status === 'PASS') num += w;
+    else if (f.status === 'WARN') num += w * 0.5;
+  }
+  return den > 0 ? Math.round((num / den) * 100) : 0;
+}
 
 export class AuditEngine {
   private rules: SecurityRule[] = allRules;
@@ -70,7 +99,11 @@ export class AuditEngine {
     // Filter rules based on options
     let rulesToRun = this.rules;
 
-    if (options?.categories && options.categories.length > 0) {
+    // Granular per-rule selection takes precedence over category selection.
+    if (options?.ruleIds && options.ruleIds.length > 0) {
+      const allow = new Set(options.ruleIds);
+      rulesToRun = rulesToRun.filter((r) => allow.has(r.id));
+    } else if (options?.categories && options.categories.length > 0) {
       rulesToRun = rulesToRun.filter((r) => options.categories!.includes(r.category));
     }
 
@@ -78,122 +111,152 @@ export class AuditEngine {
       rulesToRun = rulesToRun.filter((r) => this.meetsMinSeverity(r.severity, options.minSeverity!));
     }
 
-    let rulesChecked = 0;
     const totalRules = rulesToRun.length;
 
-    // Track which tenant-level checks have been run (to avoid duplicates)
-    const tenantChecksRun = new Set<string>();
+    // Partition rules by the object type they evaluate so we can run them
+    // load-balancer-by-load-balancer (LB + its resolved sub-objects).
+    const tenantRules = rulesToRun.filter((r) => r.id.includes('TENANT'));
+    const lbRules = rulesToRun.filter((r) => !r.id.includes('TENANT') && r.appliesTo.includes('http_loadbalancer'));
+    const opRules = rulesToRun.filter((r) => r.appliesTo.includes('origin_pool'));
+    const hcRules = rulesToRun.filter((r) => r.appliesTo.includes('healthcheck'));
+    const wafObjRules = rulesToRun.filter((r) => r.appliesTo.includes('app_firewall'));
+    const certRules = rulesToRun.filter((r) => r.appliesTo.includes('certificate'));
+    const spRules = rulesToRun.filter((r) => r.appliesTo.includes('service_policy'));
 
-    for (const rule of rulesToRun) {
-      if (this.aborted) {
-        throw new Error('Audit aborted');
+    // Run a single rule against one object and record the finding, tagged with
+    // the load balancer it belongs to.
+    const addFinding = (
+      rule: SecurityRule,
+      object: unknown,
+      namespace: string,
+      objectType: ConfigObjectType,
+      objectName: string,
+      loadBalancer: string
+    ) => {
+      const base = {
+        ruleId: rule.id,
+        ruleName: rule.name,
+        severity: rule.severity,
+        risk: rule.risk ?? severityToRisk(rule.severity),
+        entitlement: rule.entitlement ?? 'Base',
+        category: rule.category,
+        namespace,
+        objectType,
+        objectName,
+        loadBalancer,
+        remediation: rule.remediation,
+        referenceUrl: rule.referenceUrl,
+      };
+      try {
+        const result = rule.check(object, context);
+        findings.push({
+          ...base,
+          status: result.status,
+          message: result.message || '',
+          currentValue: result.currentValue,
+          expectedValue: result.expectedValue,
+          details: result.details,
+        });
+      } catch (error) {
+        findings.push({ ...base, status: 'ERROR', message: `Error running check: ${(error as Error).message}` });
       }
+    };
 
-      // Special handling for tenant-level rules (run once, not per object)
-      if (rule.id.includes('TENANT')) {
-        if (tenantChecksRun.has(rule.id)) {
-          continue;
-        }
-        tenantChecksRun.add(rule.id);
+    // Track which sub-objects were attributed to a load balancer so we can
+    // surface the remainder as "unattached".
+    const usedPools = new Set<string>();
+    const usedWaf = new Set<string>();
+    const usedCert = new Set<string>();
+    const usedSP = new Set<string>();
 
-        // Run tenant-level check once with a dummy object
-        try {
-          const result = rule.check({}, context);
+    const lbEntries = [...context.configs.httpLoadBalancers.entries()];
+    const totalLb = Math.max(lbEntries.length, 1);
+    let lbIndex = 0;
 
-          const finding: AuditFinding = {
-            ruleId: rule.id,
-            ruleName: rule.name,
-            severity: rule.severity,
-            category: rule.category,
-            namespace: 'tenant-wide',
-            objectType: 'http_loadbalancer',
-            objectName: 'Tenant Configuration',
-            status: result.status,
-            message: result.message || '',
-            currentValue: result.currentValue,
-            expectedValue: result.expectedValue,
-            remediation: rule.remediation,
-            referenceUrl: rule.referenceUrl,
-            details: result.details,
-          };
+    for (const [lbKey, lbObj] of lbEntries) {
+      if (this.aborted) throw new Error('Audit aborted');
 
-          if (options?.includePassedChecks || result.status !== 'PASS') {
-            findings.push(finding);
-          } else if (result.status === 'PASS') {
-            findings.push(finding); // Always include passed for stats
+      const lbNs = lbKey.split('/')[0];
+      const lbName = (getMetadata(lbObj).name as string) || lbKey.split('/')[1] || lbKey;
+      const spec = ((lbObj as Record<string, unknown>).spec ||
+        (lbObj as Record<string, unknown>).get_spec ||
+        lbObj) as Record<string, unknown>;
+
+      // LB-level checks
+      for (const rule of lbRules) addFinding(rule, lbObj, lbNs, 'http_loadbalancer', lbName, lbName);
+
+      // Origin pools referenced by this LB (+ their health checks)
+      for (const ref of this.collectPoolRefs(spec)) {
+        const resolved = this.resolveRef(context.configs.originPools, ref, lbNs);
+        if (!resolved) continue;
+        usedPools.add(resolved.key);
+        const poolNs = resolved.key.split('/')[0] || lbNs;
+        const name = (getMetadata(resolved.obj).name as string) || ref.name;
+        for (const rule of opRules) addFinding(rule, resolved.obj, lbNs, 'origin_pool', name, lbName);
+
+        // Health checks referenced by this origin pool
+        if (hcRules.length > 0) {
+          const poolSpec = ((resolved.obj as Record<string, unknown>).spec ||
+            (resolved.obj as Record<string, unknown>).get_spec ||
+            resolved.obj) as Record<string, unknown>;
+          const hcRefs = Array.isArray(poolSpec.healthcheck) ? (poolSpec.healthcheck as unknown[]) : [];
+          for (const hcRefRaw of hcRefs) {
+            const hcRef = this.refFrom(hcRefRaw);
+            if (!hcRef) continue;
+            const hc = this.resolveRef(context.configs.healthChecks, hcRef, poolNs);
+            if (!hc) continue;
+            const hcName = (getMetadata(hc.obj).name as string) || hcRef.name;
+            for (const rule of hcRules) addFinding(rule, hc.obj, lbNs, 'healthcheck', `${name} / ${hcName}`, lbName);
           }
-        } catch (error) {
-          findings.push({
-            ruleId: rule.id,
-            ruleName: rule.name,
-            severity: rule.severity,
-            category: rule.category,
-            namespace: 'tenant-wide',
-            objectType: 'http_loadbalancer',
-            objectName: 'Tenant Configuration',
-            status: 'ERROR',
-            message: `Error running check: ${(error as Error).message}`,
-            remediation: rule.remediation,
-          });
-        }
-
-        rulesChecked++;
-        continue;
-      }
-
-      // Get objects this rule applies to
-      const objectsToCheck = this.getObjectsForRule(rule, context);
-
-      // Run the rule against each applicable object
-      for (const { object, namespace, objectType } of objectsToCheck) {
-        try {
-          const result = rule.check(object, context);
-
-          const metadata = getMetadata(object);
-          const finding: AuditFinding = {
-            ruleId: rule.id,
-            ruleName: rule.name,
-            severity: rule.severity,
-            category: rule.category,
-            namespace,
-            objectType,
-            objectName: (metadata?.name as string) || 'unknown',
-            status: result.status,
-            message: result.message || '',
-            currentValue: result.currentValue,
-            expectedValue: result.expectedValue,
-            remediation: rule.remediation,
-            referenceUrl: rule.referenceUrl,
-            details: result.details,
-          };
-
-          findings.push(finding);
-        } catch (error) {
-          const metadata = getMetadata(object);
-          findings.push({
-            ruleId: rule.id,
-            ruleName: rule.name,
-            severity: rule.severity,
-            category: rule.category,
-            namespace,
-            objectType,
-            objectName: (metadata?.name as string) || 'unknown',
-            status: 'ERROR',
-            message: `Error running check: ${(error as Error).message}`,
-            remediation: rule.remediation,
-          });
         }
       }
 
-      rulesChecked++;
+      // App firewall (WAF) referenced by this LB
+      const wafRef = this.refFrom(spec.app_firewall);
+      if (wafRef) {
+        const resolved = this.resolveRef(context.configs.appFirewalls, wafRef, lbNs);
+        if (resolved) {
+          usedWaf.add(resolved.key);
+          const name = (getMetadata(resolved.obj).name as string) || wafRef.name;
+          for (const rule of wafObjRules) addFinding(rule, resolved.obj, lbNs, 'app_firewall', name, lbName);
+        }
+      }
+
+      // Service policies referenced by this LB
+      for (const ref of this.servicePolicyRefs(spec)) {
+        const resolved = this.resolveRef(context.configs.servicePolicies, ref, lbNs);
+        if (!resolved) continue;
+        usedSP.add(resolved.key);
+        const name = (getMetadata(resolved.obj).name as string) || ref.name;
+        for (const rule of spRules) addFinding(rule, resolved.obj, lbNs, 'service_policy', name, lbName);
+      }
+
+      // Custom certificates referenced by this LB
+      for (const ref of this.certRefs(spec)) {
+        const resolved = this.resolveRef(context.configs.certificates, ref, lbNs);
+        if (!resolved) continue;
+        usedCert.add(resolved.key);
+        const name = (getMetadata(resolved.obj).name as string) || ref.name;
+        for (const rule of certRules) addFinding(rule, resolved.obj, lbNs, 'certificate', name, lbName);
+      }
+
+      lbIndex++;
       this.reportProgress({
         phase: 'scanning',
-        message: `Checking rule ${rule.id}: ${rule.name}`,
-        progress: 20 + Math.round((rulesChecked / totalRules) * 70),
-        rulesChecked,
+        message: `Auditing load balancer: ${lbName}`,
+        progress: 20 + Math.round((lbIndex / totalLb) * 65),
+        rulesChecked: lbIndex,
         totalRules,
         findingsCount: findings.filter((f) => f.status === 'FAIL').length,
       });
+    }
+
+    // Note: objects NOT referenced by any load balancer are intentionally not
+    // reported — the audit covers each LB and its attached child objects only.
+
+    // Tenant-wide checks (SIEM, alerting) — run once, not per LB
+    for (const rule of tenantRules) {
+      addFinding(rule, {}, 'tenant-wide', 'http_loadbalancer', 'Tenant Configuration', '(tenant-wide)');
     }
 
     // PHASE 3: Generate report
@@ -230,6 +293,7 @@ export class AuditEngine {
       alertReceivers: new Map(),
       globalLogReceivers: new Map(),
       userIdentifications: new Map(),
+      dnsZones: new Map(),
     };
 
     let totalFetched = 0;
@@ -258,6 +322,7 @@ export class AuditEngine {
         this.fetchAlertPolicies(namespace),
         this.fetchAlertReceivers(namespace),
         this.fetchUserIdentifications(namespace),
+        this.fetchCertificates(namespace),
       ]);
 
       // Process results
@@ -316,6 +381,13 @@ export class AuditEngine {
           totalFetched++;
         }
       }
+
+      if (results[8].status === 'fulfilled') {
+        for (const [key, value] of results[8].value) {
+          configs.certificates.set(key, value);
+          totalFetched++;
+        }
+      }
     }
 
     // Fetch global objects (shared namespace)
@@ -327,6 +399,17 @@ export class AuditEngine {
       }
     } catch (e) {
       console.warn('Could not fetch global log receivers:', e);
+    }
+
+    // Fetch XC-hosted DNS zones (tenant-wide, for DNSSEC) — best effort.
+    try {
+      const zoneMap = await this.fetchDnsZones();
+      for (const [key, value] of zoneMap) {
+        configs.dnsZones.set(key, value);
+        totalFetched++;
+      }
+    } catch (e) {
+      console.warn('Could not fetch DNS zones:', e);
     }
 
     // Build context with helper methods
@@ -403,7 +486,7 @@ export class AuditEngine {
         if (!name) continue;
 
         try {
-          const full = await apiClient.getWAFPolicy(namespace, name);
+          const full = await apiClient.get(`/api/config/namespaces/${namespace}/app_firewalls/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
           result.set(`${namespace}/${name}`, item);
@@ -426,7 +509,7 @@ export class AuditEngine {
         if (!name) continue;
 
         try {
-          const full = await apiClient.getHealthCheck(namespace, name);
+          const full = await apiClient.get(`/api/config/namespaces/${namespace}/healthchecks/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
           result.set(`${namespace}/${name}`, item);
@@ -514,7 +597,7 @@ export class AuditEngine {
         if (!name) continue;
 
         try {
-          const full = await apiClient.getUserIdentificationPolicy(namespace, name);
+          const full = await apiClient.get(`/api/config/namespaces/${namespace}/user_identifications/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
           result.set(`${namespace}/${name}`, item);
@@ -526,79 +609,170 @@ export class AuditEngine {
     return result;
   }
 
-  private async fetchGlobalLogReceivers(): Promise<Map<string, unknown>> {
+  private async fetchCertificates(namespace: string): Promise<Map<string, unknown>> {
     const result = new Map<string, unknown>();
     try {
       const resp = await apiClient.get<{ items: Array<{ metadata?: { name: string }; name?: string }> }>(
-        `/api/config/namespaces/shared/global_log_receivers`
+        `/api/config/namespaces/${namespace}/certificates`
       );
       for (const item of resp.items || []) {
         const name = item.metadata?.name || item.name;
-        if (name) {
-          result.set(`shared/${name}`, item);
+        if (!name) continue;
+
+        try {
+          const full = await apiClient.get(`/api/config/namespaces/${namespace}/certificates/${name}`);
+          result.set(`${namespace}/${name}`, full);
+        } catch {
+          result.set(`${namespace}/${name}`, item);
         }
       }
     } catch (e) {
-      console.warn('Failed to fetch global log receivers:', e);
+      console.warn(`Failed to fetch certificates from ${namespace}:`, e);
+    }
+    return result;
+  }
+
+  private async fetchGlobalLogReceivers(): Promise<Map<string, unknown>> {
+    const result = new Map<string, unknown>();
+    // Global log receivers live in the system namespace (Multi-Cloud Network
+    // Connect → Log Management) or the shared namespace (Shared Configuration).
+    // Check both so a SIEM configured in either is detected.
+    for (const ns of ['system', 'shared']) {
+      try {
+        const resp = await apiClient.get<{ items: Array<{ metadata?: { name: string }; name?: string }> }>(
+          `/api/config/namespaces/${ns}/global_log_receivers`
+        );
+        for (const item of resp.items || []) {
+          const name = item.metadata?.name || item.name;
+          if (!name) continue;
+          // Fetch the full object so log-type coverage (TENANT-LOG-02) is visible.
+          try {
+            const full = await apiClient.get(`/api/config/namespaces/${ns}/global_log_receivers/${name}`);
+            result.set(`${ns}/${name}`, full);
+          } catch {
+            result.set(`${ns}/${name}`, item);
+          }
+        }
+      } catch (e) {
+        console.warn(`Failed to fetch global log receivers from ${ns}:`, e);
+      }
+    }
+    return result;
+  }
+
+  private async fetchDnsZones(): Promise<Map<string, unknown>> {
+    const result = new Map<string, unknown>();
+    // DNS zones are managed in the system namespace under the DNS config path.
+    const paths = ['/api/config/dns/namespaces/system/dns_zones', '/api/config/namespaces/system/dns_zones'];
+    for (const path of paths) {
+      try {
+        const resp = await apiClient.get<{ items: Array<{ metadata?: { name: string }; name?: string }> }>(path);
+        for (const item of resp.items || []) {
+          const name = item.metadata?.name || item.name;
+          if (!name || result.has(`system/${name}`)) continue;
+          try {
+            const full = await apiClient.get(`${path}/${name}`);
+            result.set(`system/${name}`, full);
+          } catch {
+            result.set(`system/${name}`, item);
+          }
+        }
+        if (result.size > 0) break; // first working path wins
+      } catch {
+        // try the next path shape
+      }
     }
     return result;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // GET OBJECTS FOR A RULE
+  // REFERENCE RESOLUTION (LB → sub-objects)
   // ─────────────────────────────────────────────────────────────────────────
 
-  private getObjectsForRule(
-    rule: SecurityRule,
-    context: AuditContext
-  ): Array<{ object: unknown; namespace: string; objectType: ConfigObjectType }> {
-    const objects: Array<{ object: unknown; namespace: string; objectType: ConfigObjectType }> = [];
-
-    for (const objectType of rule.appliesTo) {
-      let configMap: Map<string, unknown>;
-
-      switch (objectType) {
-        case 'http_loadbalancer':
-          configMap = context.configs.httpLoadBalancers;
-          break;
-        case 'origin_pool':
-          configMap = context.configs.originPools;
-          break;
-        case 'app_firewall':
-          configMap = context.configs.appFirewalls;
-          break;
-        case 'healthcheck':
-          configMap = context.configs.healthChecks;
-          break;
-        case 'service_policy':
-          configMap = context.configs.servicePolicies;
-          break;
-        case 'certificate':
-          configMap = context.configs.certificates;
-          break;
-        case 'alert_policy':
-          configMap = context.configs.alertPolicies;
-          break;
-        case 'alert_receiver':
-          configMap = context.configs.alertReceivers;
-          break;
-        case 'global_log_receiver':
-          configMap = context.configs.globalLogReceivers;
-          break;
-        case 'user_identification':
-          configMap = context.configs.userIdentifications;
-          break;
-        default:
-          continue;
-      }
-
-      for (const [key, object] of configMap) {
-        const [namespace] = key.split('/');
-        objects.push({ object, namespace, objectType });
+  /** Normalize an XC object reference into { name, namespace? }. */
+  private refFrom(val: unknown): { name: string; namespace?: string } | null {
+    if (!val) return null;
+    if (typeof val === 'string') return val ? { name: val } : null;
+    if (typeof val === 'object') {
+      const o = val as Record<string, unknown>;
+      if (typeof o.name === 'string' && o.name) {
+        return { name: o.name, namespace: typeof o.namespace === 'string' ? o.namespace : undefined };
       }
     }
+    return null;
+  }
 
-    return objects;
+  /** Resolve a reference against a config map, trying ns-qualified keys then a name match. */
+  private resolveRef(
+    map: Map<string, unknown>,
+    ref: { name: string; namespace?: string },
+    lbNamespace: string
+  ): { key: string; obj: unknown } | null {
+    const candidates = [
+      `${ref.namespace || lbNamespace}/${ref.name}`,
+      `${lbNamespace}/${ref.name}`,
+      `shared/${ref.name}`,
+    ];
+    for (const c of candidates) {
+      if (map.has(c)) return { key: c, obj: map.get(c) };
+    }
+    for (const [k, v] of map) {
+      if (k.endsWith(`/${ref.name}`)) return { key: k, obj: v };
+    }
+    return null;
+  }
+
+  /** All origin-pool references on an LB spec (default route + per-route actions). */
+  private collectPoolRefs(spec: Record<string, unknown>): Array<{ name: string; namespace?: string }> {
+    const refs: Array<{ name: string; namespace?: string }> = [];
+    const seen = new Set<string>();
+    const add = (poolHolder: unknown) => {
+      const ref = this.refFrom((poolHolder as Record<string, unknown>)?.pool);
+      if (ref && !seen.has(ref.name)) {
+        seen.add(ref.name);
+        refs.push(ref);
+      }
+    };
+
+    for (const p of (spec.default_route_pools as unknown[]) || []) add(p);
+
+    for (const route of (spec.routes as Array<Record<string, unknown>>) || []) {
+      for (const p of (route.origin_pools as unknown[]) || []) add(p);
+      const ra = route.route_action as Record<string, unknown> | undefined;
+      if (ra) {
+        if (ra.single_default_pool) add(ra.single_default_pool);
+        const wp = (ra.weighted_pools as Record<string, unknown> | undefined)?.pools as unknown[] | undefined;
+        for (const p of wp || []) add(p);
+      }
+      const simple = route.simple_route_action as Record<string, unknown> | undefined;
+      for (const p of (simple?.origin_pools as unknown[]) || []) add(p);
+    }
+    return refs;
+  }
+
+  /** Service-policy references on an LB spec (active_service_policies). */
+  private servicePolicyRefs(spec: Record<string, unknown>): Array<{ name: string; namespace?: string }> {
+    const active = spec.active_service_policies as Record<string, unknown> | undefined;
+    const policies = (active?.policies as unknown[]) || [];
+    return policies.map((p) => this.refFrom(p)).filter((r): r is { name: string; namespace?: string } => !!r);
+  }
+
+  /** Custom-certificate object references on an LB's HTTPS spec. */
+  private certRefs(spec: Record<string, unknown>): Array<{ name: string; namespace?: string }> {
+    const https = (spec.https || spec.https_auto_cert) as Record<string, unknown> | undefined;
+    if (!https) return [];
+    const refs: Array<{ name: string; namespace?: string }> = [];
+    const certParams = https.tls_cert_params as Record<string, unknown> | undefined;
+    for (const c of (certParams?.certificates as unknown[]) || []) {
+      const r = this.refFrom(c);
+      if (r) refs.push(r);
+    }
+    // Some configs reference cert objects directly under tls_certificates
+    for (const c of (https.tls_certificates as Array<Record<string, unknown>>) || []) {
+      const r = this.refFrom(c.certificate || c);
+      if (r) refs.push(r);
+    }
+    return refs;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -610,13 +784,11 @@ export class AuditEngine {
     context: AuditContext,
     namespaces: string[],
     startTime: number,
-    options?: AuditOptions
+    _options?: AuditOptions
   ): AuditReport {
-    // Filter out passed checks if not requested
-    let reportFindings = findings;
-    if (!options?.includePassedChecks) {
-      reportFindings = findings.filter((f) => f.status !== 'PASS');
-    }
+    // The report retains EVERY finding (PASS/FAIL/WARN/SKIP) so exports can
+    // present a complete checklist ("checkbook"). The UI filters for display.
+    const reportFindings = findings;
 
     // Calculate summary
     const summary: AuditSummary = {
@@ -630,12 +802,77 @@ export class AuditEngine {
       warnings: findings.filter((f) => f.status === 'WARN').length,
       errors: findings.filter((f) => f.status === 'ERROR').length,
       skipped: findings.filter((f) => f.status === 'SKIP').length,
+      informational: findings.filter((f) => f.status === 'INFO').length,
     };
 
-    // Calculate security score (0-100)
-    const totalChecks = findings.filter((f) => f.status !== 'SKIP' && f.status !== 'ERROR').length;
-    const passedChecks = summary.passed;
-    const score = totalChecks > 0 ? Math.round((passedChecks / totalChecks) * 100) : 0;
+    // Severity-weighted security score (0-100). A failed CRITICAL check costs
+    // far more than a low-severity warning; WARN gets half credit, FAIL zero.
+    // SKIP/ERROR are excluded. Applied consistently to overall + every scope.
+    const score = weightedScore(findings);
+
+    // Entitlement breakdown of FAILED checks — tells the customer how many gaps
+    // are config fixes vs. require a licensed add-on.
+    const failed = findings.filter((f) => f.status === 'FAIL');
+    const entitlementSummary: EntitlementSummary = {
+      baseFails: failed.filter((f) => f.entitlement === 'Base').length,
+      entitlementFails: failed.filter((f) => f.entitlement === 'Entitlement').length,
+      configFails: failed.filter((f) => f.entitlement === 'Config').length,
+    };
+
+    // Per-scope rollups (namespace + load balancer)
+    const blankScope = (): ScopeSummary => ({ total: 0, pass: 0, fail: 0, warn: 0, na: 0, score: 0 });
+    const tally = (s: ScopeSummary, status: string) => {
+      s.total++;
+      if (status === 'PASS') s.pass++;
+      else if (status === 'FAIL') s.fail++;
+      else if (status === 'WARN') s.warn++;
+      else s.na++;
+    };
+
+    const nsMap = new Map<string, NamespaceSummary>();
+    const nsLbs = new Map<string, Set<string>>();
+    const nsFindings = new Map<string, AuditFinding[]>();
+    const lbMap = new Map<string, LoadBalancerSummary>();
+    const lbFindingsByKey = new Map<string, AuditFinding[]>();
+
+    for (const f of findings) {
+      // namespace rollup
+      let ns = nsMap.get(f.namespace);
+      if (!ns) {
+        ns = { namespace: f.namespace, loadBalancers: 0, ...blankScope() };
+        nsMap.set(f.namespace, ns);
+        nsLbs.set(f.namespace, new Set());
+        nsFindings.set(f.namespace, []);
+      }
+      tally(ns, f.status);
+      nsFindings.get(f.namespace)!.push(f);
+      if (f.loadBalancer && f.loadBalancer !== '(tenant-wide)' && f.loadBalancer !== '(unattached)') {
+        nsLbs.get(f.namespace)!.add(f.loadBalancer);
+      }
+
+      // load balancer rollup
+      const lbKey = `${f.namespace}|${f.loadBalancer}`;
+      let lb = lbMap.get(lbKey);
+      if (!lb) {
+        lb = { namespace: f.namespace, loadBalancer: f.loadBalancer, ...blankScope() };
+        lbMap.set(lbKey, lb);
+        lbFindingsByKey.set(lbKey, []);
+      }
+      tally(lb, f.status);
+      lbFindingsByKey.get(lbKey)!.push(f);
+    }
+    for (const ns of nsMap.values()) {
+      ns.loadBalancers = nsLbs.get(ns.namespace)?.size ?? 0;
+      ns.score = weightedScore(nsFindings.get(ns.namespace) || []);
+    }
+    for (const lb of lbMap.values()) {
+      lb.score = weightedScore(lbFindingsByKey.get(`${lb.namespace}|${lb.loadBalancer}`) || []);
+    }
+
+    const namespaceSummary = [...nsMap.values()].sort((a, b) => a.namespace.localeCompare(b.namespace));
+    const loadBalancerSummary = [...lbMap.values()].sort(
+      (a, b) => a.namespace.localeCompare(b.namespace) || a.loadBalancer.localeCompare(b.loadBalancer)
+    );
 
     // Config snapshot
     const configSnapshot: ConfigSnapshot = {
@@ -671,9 +908,10 @@ export class AuditEngine {
         const statusOrder: Record<string, number> = {
           FAIL: 0,
           WARN: 1,
-          ERROR: 2,
-          PASS: 3,
-          SKIP: 4,
+          INFO: 2,
+          ERROR: 3,
+          PASS: 4,
+          SKIP: 5,
         };
 
         const sevDiff = severityOrder[a.severity] - severityOrder[b.severity];
@@ -682,6 +920,9 @@ export class AuditEngine {
         return (statusOrder[a.status] || 5) - (statusOrder[b.status] || 5);
       }),
       configSnapshot,
+      entitlementSummary,
+      namespaceSummary,
+      loadBalancerSummary,
     };
   }
 

@@ -1,10 +1,9 @@
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { ExternalLink, Clock, ChevronDown, LogOut, Moon, Sun, Sunrise } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { useTheme } from '../context/ThemeContext';
 
 export function Header() {
-  const location = useLocation();
   const navigate = useNavigate();
   const { isConnected, tenant, disconnect } = useApp();
   const { theme, cycleTheme } = useTheme();

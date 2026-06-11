@@ -135,7 +135,7 @@ const getDatesForWeekOffset = (offsetWeeks: number) => {
   const start = getStartOfWeek(new Date());
   start.setDate(start.getDate() + (offsetWeeks * 7));
   
-  const dates: Record<string, { label: string, fullDate: string }> = {};
+  const dates: Record<string, { label: string, dayLabel: string, dateLabel: string, fullDate: string }> = {};
   DAYS.forEach((day, index) => {
     const d = new Date(start);
     d.setDate(d.getDate() + index);
@@ -460,7 +460,7 @@ function ReportsPanel({ token }: ReportsPanelProps) {
   const filteredCustomerWeeklyData = useMemo(() => {
     if (!selectedCustomer) return customerWeeklyData;
     return customerWeeklyData.map(row => {
-      const { week, ...rest } = row;
+      const { week, ...rest } = row as Record<string, number | string>;
       const filtered: Record<string, any> = { week };
       if (selectedCustomer === 'Internal') {
         if (rest['Internal'] !== undefined) filtered['Internal'] = rest['Internal'];
@@ -627,7 +627,7 @@ function ReportsPanel({ token }: ReportsPanelProps) {
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                   <XAxis dataKey="week" tick={{ fill: '#64748b', fontSize: 11 }} axisLine={{ stroke: '#334155' }} tickLine={false} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <Tooltip contentStyle={tooltipStyle} formatter={(v: any, name: string) => [`${v}h`, name]} labelFormatter={(l) => `Week of ${l}`} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v: any, name: any) => [`${v}h`, name]} labelFormatter={(l) => `Week of ${l}`} />
                   <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '10px' }} />
                   <Bar dataKey="External" stackId="a" fill="#3b82f6" maxBarSize={40} radius={[0, 0, 0, 0]} />
                   <Bar dataKey="Internal" stackId="a" fill="#f59e0b" maxBarSize={40} radius={[3, 3, 0, 0]} />
@@ -637,7 +637,7 @@ function ReportsPanel({ token }: ReportsPanelProps) {
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                   <XAxis dataKey="week" tick={{ fill: '#64748b', fontSize: 11 }} axisLine={{ stroke: '#334155' }} tickLine={false} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <Tooltip contentStyle={tooltipStyle} formatter={(v: any, name: string) => [`${v}h`, name]} labelFormatter={(l) => `Week of ${l}`} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v: any, name: any) => [`${v}h`, name]} labelFormatter={(l) => `Week of ${l}`} />
                   <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '10px' }} />
                   <Line type="monotone" dataKey="External" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3, fill: '#3b82f6', strokeWidth: 0 }} activeDot={{ r: 5, strokeWidth: 0 }} />
                   <Line type="monotone" dataKey="Internal" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3, fill: '#f59e0b', strokeWidth: 0 }} activeDot={{ r: 5, strokeWidth: 0 }} />

@@ -4,6 +4,14 @@
 
 export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
 
+// Customer-facing risk level (mirrors the F5 XC proactive assessment checklist).
+// Derived from severity when a rule does not set it explicitly.
+export type RiskLevel = 'High' | 'Med' | 'Low';
+
+// Whether the control is part of the base bundle, requires a licensed add-on,
+// or is purely a configuration choice with no extra license.
+export type Entitlement = 'Base' | 'Entitlement' | 'Config';
+
 export type RuleCategory =
   | 'TLS_SSL'
   | 'WAF'
@@ -16,7 +24,10 @@ export type RuleCategory =
   | 'ALERTING'
   | 'USER_IDENTIFICATION'
   | 'RATE_LIMITING'
-  | 'CLIENT_SECURITY';
+  | 'CLIENT_SECURITY'
+  | 'EXPOSURE'
+  | 'IAM'
+  | 'DNS';
 
 export type ConfigObjectType =
   | 'http_loadbalancer'
@@ -28,9 +39,13 @@ export type ConfigObjectType =
   | 'alert_policy'
   | 'alert_receiver'
   | 'certificate'
-  | 'global_log_receiver';
+  | 'global_log_receiver'
+  | 'dns_zone'
+  | 'tenant';
 
-export type CheckStatus = 'PASS' | 'FAIL' | 'WARN' | 'SKIP' | 'ERROR';
+// INFO = informational / "confirm intent" outcome — surfaced as a review item
+// but NOT scored (treated like SKIP for the weighted score).
+export type CheckStatus = 'PASS' | 'FAIL' | 'WARN' | 'INFO' | 'SKIP' | 'ERROR';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Check Result - Output from running a rule against one object
@@ -61,6 +76,7 @@ export interface AuditContext {
     alertReceivers: Map<string, unknown>;
     globalLogReceivers: Map<string, unknown>;
     userIdentifications: Map<string, unknown>;
+    dnsZones: Map<string, unknown>;
   };
   // Helper methods for cross-referencing
   getOriginPool: (namespace: string, name: string) => unknown | undefined;
@@ -81,6 +97,14 @@ export interface SecurityRule {
   description: string;
   category: RuleCategory;
   severity: Severity;
+  // Customer-facing risk if misconfigured. Optional — engine derives it from
+  // severity when omitted (CRITICAL/HIGH→High, MEDIUM→Med, LOW/INFO→Low).
+  risk?: RiskLevel;
+  // Licensing context for the control. Defaults to 'Base' when omitted.
+  entitlement?: Entitlement;
+  // Short, customer-friendly expected value shown in checklist exports
+  // (e.g. "Enabled", "Blocking", "TLS 1.2+"). Optional.
+  expectedDisplay?: string;
   appliesTo: ConfigObjectType[];
   check: (object: unknown, context: AuditContext) => CheckResult;
   remediation: string;
@@ -95,8 +119,14 @@ export interface AuditFinding {
   ruleId: string;
   ruleName: string;
   severity: Severity;
+  risk: RiskLevel;
+  entitlement: Entitlement;
   category: RuleCategory;
   namespace: string;
+  // The load balancer this finding belongs to. Sub-object findings (origin
+  // pool, WAF, cert, service policy) are attributed to the LB that references
+  // them. Special values: '(unattached)' and '(tenant-wide)'.
+  loadBalancer: string;
   objectType: ConfigObjectType;
   objectName: string;
   status: CheckStatus;
@@ -140,6 +170,34 @@ export interface AuditSummary {
   warnings: number;
   errors: number;
   skipped: number;
+  informational: number;
+}
+
+export interface ScopeSummary {
+  total: number;
+  pass: number;
+  fail: number;
+  warn: number;
+  na: number;
+  score: number;
+}
+
+export interface NamespaceSummary extends ScopeSummary {
+  namespace: string;
+  loadBalancers: number;
+}
+
+export interface LoadBalancerSummary extends ScopeSummary {
+  namespace: string;
+  loadBalancer: string;
+}
+
+export interface EntitlementSummary {
+  // Number of FAILED checks grouped by entitlement — tells the customer how
+  // many gaps are configuration fixes vs. require a licensed add-on.
+  baseFails: number;
+  entitlementFails: number;
+  configFails: number;
 }
 
 export interface ConfigSnapshot {
@@ -165,6 +223,9 @@ export interface AuditReport {
   score: number;
   findings: AuditFinding[];
   configSnapshot: ConfigSnapshot;
+  entitlementSummary: EntitlementSummary;
+  namespaceSummary: NamespaceSummary[];
+  loadBalancerSummary: LoadBalancerSummary[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -173,6 +234,9 @@ export interface AuditReport {
 
 export interface AuditOptions {
   categories?: RuleCategory[];
+  // Explicit set of rule IDs to run (granular selection). Takes precedence
+  // over `categories` when provided.
+  ruleIds?: string[];
   minSeverity?: Severity;
   includePassedChecks?: boolean;
 }
@@ -194,6 +258,9 @@ export const CATEGORY_INFO: Record<RuleCategory, { label: string; icon: string; 
   USER_IDENTIFICATION: { label: 'User Identification', icon: '👤', description: 'User tracking and identification' },
   RATE_LIMITING: { label: 'Rate Limiting', icon: '⏱️', description: 'Rate limiting configuration' },
   CLIENT_SECURITY: { label: 'Client-Side Security', icon: '🖥️', description: 'Client-side defense settings' },
+  EXPOSURE: { label: 'Exposure & Advertisement', icon: '📡', description: 'VIP advertisement scope and domain exposure' },
+  IAM: { label: 'Identity & Access (Tenant)', icon: '🔑', description: 'Tenant credential, SSO/MFA and session governance' },
+  DNS: { label: 'DNS Security', icon: '🌐', description: 'DNSSEC and DNS-zone protection' },
 };
 
 export const SEVERITY_INFO: Record<Severity, { label: string; color: string; bgColor: string; order: number }> = {
@@ -204,10 +271,51 @@ export const SEVERITY_INFO: Record<Severity, { label: string; color: string; bgC
   INFO: { label: 'Info', color: 'text-slate-400', bgColor: 'bg-slate-500/20', order: 4 },
 };
 
+export const RISK_INFO: Record<RiskLevel, { label: string; color: string; bgColor: string }> = {
+  High: { label: 'High', color: 'text-red-400', bgColor: 'bg-red-500/20' },
+  Med: { label: 'Med', color: 'text-yellow-400', bgColor: 'bg-yellow-500/20' },
+  Low: { label: 'Low', color: 'text-emerald-400', bgColor: 'bg-emerald-500/20' },
+};
+
+export const ENTITLEMENT_INFO: Record<Entitlement, { label: string; description: string; color: string; bgColor: string }> = {
+  Base: {
+    label: 'Base',
+    description: 'Included in the WAAP base bundle — no extra license required.',
+    color: 'text-emerald-400',
+    bgColor: 'bg-emerald-500/20',
+  },
+  Entitlement: {
+    label: 'Add-on',
+    description: 'Requires a licensed add-on / metered SKU (e.g. Bot Defense, Rate Limiting, CDN).',
+    color: 'text-amber-400',
+    bgColor: 'bg-amber-500/20',
+  },
+  Config: {
+    label: 'Config',
+    description: 'Configuration-only — no extra license needed.',
+    color: 'text-slate-300',
+    bgColor: 'bg-slate-500/20',
+  },
+};
+
+// Derive the customer-facing risk level from a rule's engineering severity.
+export function severityToRisk(severity: Severity): RiskLevel {
+  switch (severity) {
+    case 'CRITICAL':
+    case 'HIGH':
+      return 'High';
+    case 'MEDIUM':
+      return 'Med';
+    default:
+      return 'Low';
+  }
+}
+
 export const STATUS_INFO: Record<CheckStatus, { label: string; color: string; bgColor: string; icon: string }> = {
   PASS: { label: 'Passed', color: 'text-green-400', bgColor: 'bg-green-500/20', icon: '✓' },
   FAIL: { label: 'Failed', color: 'text-red-400', bgColor: 'bg-red-500/20', icon: '✗' },
   WARN: { label: 'Warning', color: 'text-yellow-400', bgColor: 'bg-yellow-500/20', icon: '⚠' },
+  INFO: { label: 'Review', color: 'text-sky-400', bgColor: 'bg-sky-500/20', icon: 'ℹ' },
   SKIP: { label: 'Skipped', color: 'text-slate-400', bgColor: 'bg-slate-500/20', icon: '○' },
   ERROR: { label: 'Error', color: 'text-purple-400', bgColor: 'bg-purple-500/20', icon: '!' },
 };
