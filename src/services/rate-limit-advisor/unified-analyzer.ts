@@ -70,6 +70,17 @@ export interface UnifiedRecommendation {
   };
 }
 
+export interface AlgorithmOption {
+  id: 'balanced' | 'simple_peak3' | 'strict' | 'lenient_p99';
+  label: string;
+  formula: string;
+  n: number;            // requests per minute
+  b: number;            // burst multiplier
+  effectiveLimit: number;
+  description: string;
+  recommended?: boolean;
+}
+
 export interface UnifiedResult {
   lbName: string;
   namespace: string;
@@ -95,8 +106,9 @@ export interface UnifiedResult {
   // Weekly shape
   dailyShape: DailyBucket[];
 
-  // Recommendation
+  // Recommendation (Balanced = default) + selectable algorithm options
   recommendation: UnifiedRecommendation;
+  algorithms: AlgorithmOption[];
 
   // Per-user data for display and simulator
   userPeaks: Array<{
@@ -219,7 +231,9 @@ export function analyzeUnified(collection: UnifiedCollection): UnifiedResult {
   const allMedians: number[] = [];
 
   for (const [userId, counts] of Object.entries(collection.userMinuteCounts)) {
-    const peak = Math.max(...counts);
+    // Peak = max requests in any rolling 60s window (token-bucket view); falls back to the
+    // calendar-minute max if per-second data wasn't tracked for this user.
+    const peak = collection.userPeakRpm?.[userId] ?? (counts.length ? Math.max(...counts) : 0);
     const med = median(counts);
     const total = counts.reduce((s, v) => s + v, 0);
     allPeaks.push(peak);
@@ -270,6 +284,57 @@ export function analyzeUnified(collection: UnifiedCollection): UnifiedResult {
     b = Math.min(BURST_MAX, Math.max(2, Math.ceil(burstRatio)));
   }
 
+  // ── Selectable algorithm options (all from the same per-user peak distribution) ──
+  const clampN = (x: number) => Math.min(XC_NUMBER_MAX, Math.max(1, Math.ceil(x)));
+  const maxPeak = allPeaks.length ? allPeaks[allPeaks.length - 1] : 0; // busiest single user-minute (untrimmed)
+  const simpleN = clampN(maxPeak * 3);
+  const strictN = clampN(p95Peaks * 1.2);
+  const lenientN = clampN(p99Peaks * 1.5);
+  const algorithms: AlgorithmOption[] = [
+    {
+      id: 'balanced', label: 'Balanced — P95 × 1.5', recommended: true,
+      formula: `ceil(P95 ${Math.round(p95Peaks)} × ${safetyFactor}), burst ${b}×`,
+      n, b, effectiveLimit: n * b,
+      description: 'P95 of per-user peak minutes with a 50% safety margin and an automatic burst multiplier. 95% of users never hit it; brief bursts are absorbed by B. Industry-standard default.',
+    },
+    {
+      id: 'simple_peak3', label: 'Simple — Peak × 3',
+      formula: `ceil(busiest minute ${Math.round(maxPeak)} × 3), burst 1×`,
+      n: simpleN, b: 1, effectiveLimit: simpleN,
+      description: 'Three times the busiest single minute any one client reached, with no burst. Dead simple and very unlikely to block a legitimate user — looser on abuse. A safe first limit to deploy in alert-only mode.',
+    },
+    {
+      id: 'strict', label: 'Strict — P95 × 1.2',
+      formula: `ceil(P95 ${Math.round(p95Peaks)} × 1.2), burst 2×`,
+      n: strictN, b: 2, effectiveLimit: strictN * 2,
+      description: 'Tighter limit (20% margin) for aggressive protection. Higher chance of clipping heavy legitimate users — validate with the simulator before enforcing.',
+    },
+    {
+      id: 'lenient_p99', label: 'Lenient — P99 × 1.5',
+      formula: `ceil(P99 ${Math.round(p99Peaks)} × 1.5), burst 1×`,
+      n: lenientN, b: 1, effectiveLimit: lenientN,
+      description: 'Covers 99% of per-user peaks with margin and no burst. Use when you have legitimate high-volume API integrations you must not disrupt.',
+    },
+  ];
+
+  // ── Data-quality & key-correctness warnings ──
+  if (collection.sampleRateMax > 1) {
+    warnings.push(`Access logs are sampled (up to ${collection.sampleRateMax}× on ${Math.round(collection.sampledShare * 100)}% of records). Per-minute counts are de-sampled estimates — validate against live traffic before enforcing in blocking mode.`);
+  }
+  if (collection.coverageGaps > 0) {
+    warnings.push(`${collection.coverageGaps} short time segment(s) exceeded the API page limit even after sub-splitting; a few high-burst minutes may be marginally undercounted (true peaks could be slightly higher).`);
+  }
+  const fetchRatio = collection.deepTotalExpected > 0 ? collection.deepTotalFetched / collection.deepTotalExpected : 1;
+  if (fetchRatio < 0.9) {
+    warnings.push(`Only ${Math.round(fetchRatio * 100)}% of expected logs were retrieved — some clients may be missing from this run. Re-run or use a shorter window.`);
+  }
+  if (!collection.hasUserIdPolicy) {
+    warnings.push(`No User Identification policy on this LB — the rate limit will key on source IP. If clients sit behind a CDN/proxy/NAT, many users share an IP and a per-IP limit can over-block. Consider a User Identification policy (cookie/header/JWT) so the limit keys per real user.`);
+  }
+  if (collection.existingRateLimit) {
+    warnings.push(`This LB already has a rate limit configured — traffic already shaped by it (and prior 429s) is excluded from the baseline, but recommendations assume you are setting a fresh limit.`);
+  }
+
   // Confidence
   let confidence: ConfidenceLevel;
   const usersAnalyzed = allPeaks.length;
@@ -315,6 +380,7 @@ export function analyzeUnified(collection: UnifiedCollection): UnifiedResult {
         p95Medians, safetyFactor,
       },
     },
+    algorithms,
     userPeaks,
     warnings,
     apiCallsUsed: collection.apiCallsUsed,
@@ -342,9 +408,9 @@ function buildRationale(
     (outliersTrimmed > 0 ? `. ${outliersTrimmed} extreme outlier${outliersTrimmed > 1 ? 's' : ''} removed from the analysis.` : '.'),
 
     // Paragraph 2: What the data shows
-    `For each user, we measured their per-minute request counts. ` +
-    `In normal operation, 95% of users send ≤${p95Medians} req/min (their typical rate). ` +
-    `In their busiest minute, 95% of users stay below ${p95Peaks} req/min — this is the P95 peak, the industry-standard baseline for rate limiting (per OWASP and cloud provider guidance).`,
+    `For each user we measured their peak request rate in any rolling 60-second window — the same view a token-bucket limiter uses, so a burst that straddles a clock-minute boundary isn't undercounted. ` +
+    `In normal operation, 95% of users send ≤${Math.round(p95Medians)} req/min (their typical rate). ` +
+    `At their busiest, 95% of users stay below ${Math.round(p95Peaks)} req/min — this is the P95 peak, the industry-standard baseline for rate limiting (per OWASP and cloud provider guidance).`,
 
     // Paragraph 3: How N is set
     `Rate Limit (N) = ${p95Peaks} × ${sf} safety margin = ${n} req/min. ` +

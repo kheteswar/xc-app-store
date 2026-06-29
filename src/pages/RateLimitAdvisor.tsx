@@ -12,7 +12,7 @@ import type { LoadBalancer, Namespace } from '../types';
 import { collectUnified } from '../services/rate-limit-advisor/unified-collector';
 import { analyzeUnified, simulateUnifiedImpact } from '../services/rate-limit-advisor/unified-analyzer';
 import type { UnifiedProgress, UnifiedCollection } from '../services/rate-limit-advisor/unified-collector';
-import type { UnifiedResult, UnifiedImpactResult } from '../services/rate-limit-advisor/unified-analyzer';
+import type { UnifiedResult, UnifiedImpactResult, AlgorithmOption } from '../services/rate-limit-advisor/unified-analyzer';
 
 // ═══════════════════════════════════════════════════════════════════
 function SearchableSelect({ value, onChange, options, placeholder, disabled }: {
@@ -61,6 +61,7 @@ export function RateLimitAdvisor() {
 
   const [sliderValue, setSliderValue] = useState(100);
   const [burstMultiplier, setBurstMultiplier] = useState(2);
+  const [selectedAlgoId, setSelectedAlgoId] = useState('balanced');
   const [showBurstExplainer, setShowBurstExplainer] = useState(false);
   const [copiedField, setCopiedField] = useState('');
   const [sections, setSections] = useState<Record<string, boolean>>({
@@ -72,6 +73,7 @@ export function RateLimitAdvisor() {
   useEffect(() => { if (selectedNamespace) { setSelectedLB(''); setResult(null); apiClient.getLoadBalancers(selectedNamespace).then(r => setLoadBalancers(r.items || [])).catch(() => toast.error('Failed to load LBs')); } }, [selectedNamespace]);
 
   const toggle = (k: string) => setSections(p => ({ ...p, [k]: !p[k] }));
+  const selectAlgo = useCallback((a: AlgorithmOption) => { setSelectedAlgoId(a.id); setSliderValue(a.n); setBurstMultiplier(a.b); }, []);
   const copy = useCallback(async (text: string, label: string) => { await navigator.clipboard.writeText(text); setCopiedField(label); setTimeout(() => setCopiedField(''), 2000); }, []);
 
   const impact = useMemo<UnifiedImpactResult | null>(() => {
@@ -89,6 +91,7 @@ export function RateLimitAdvisor() {
       setResult(res);
       setSliderValue(res.recommendation.numberOfRequests);
       setBurstMultiplier(res.recommendation.burstMultiplier);
+      setSelectedAlgoId('balanced');
       toast.success(`Analysis complete — ${res.apiCallsUsed} API calls in ${res.runtimeSeconds}s`);
     } catch (err) {
       toast.error(`Analysis failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -121,8 +124,9 @@ export function RateLimitAdvisor() {
               className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-slate-100 disabled:opacity-50">
               <option value={1}>Last 1 hour</option><option value={4}>Last 4 hours</option>
               <option value={12}>Last 12 hours</option><option value={24}>Last 24 hours</option>
+              <option value={48}>Last 48 hours</option><option value={168}>Last 7 days</option>
             </select>
-            <p className="text-[10px] text-slate-500 mt-1">7-day baseline always runs automatically for weekly context</p></div>
+            <p className="text-[10px] text-slate-500 mt-1">7-day baseline always runs for weekly context. Longer deep scans capture more peaks but take longer (more API calls).</p></div>
         </div>
         <div className="flex items-center gap-4">
           <button onClick={runAnalysis} disabled={isRunning || !selectedLB}
@@ -151,7 +155,7 @@ export function RateLimitAdvisor() {
 
           {/* Recommendation */}
           <Section title="Recommendation" icon={Target} collapsible open={sections.recommendation} onToggle={() => toggle('recommendation')}>
-            <RecommendationDisplay result={result} />
+            <RecommendationDisplay result={result} selectedAlgoId={selectedAlgoId} onSelect={selectAlgo} />
           </Section>
 
           {/* Per-User Statistics */}
@@ -214,9 +218,11 @@ function TrafficOverview({ result }: { result: UnifiedResult }) {
   const filterRows = [
     { label: 'WAF Blocked', v7d: fb7d.waf_block, vDeep: fbDeep.waf_block, icon: Shield },
     { label: 'Bot Malicious', v7d: fb7d.bot_malicious, vDeep: fbDeep.bot_malicious, icon: Zap },
+    { label: 'Good Bots (crawlers)', v7d: fb7d.good_bot ?? 0, vDeep: fbDeep.good_bot ?? 0, icon: Zap },
     { label: 'Policy Deny', v7d: fb7d.policy_deny ?? 0, vDeep: fbDeep.policy_deny, icon: AlertTriangle },
     { label: 'MUM Action', v7d: fb7d.mum_action ?? 0, vDeep: fbDeep.mum_action, icon: Users },
     { label: 'IP High Risk', v7d: fb7d.ip_high_risk, vDeep: fbDeep.ip_high_risk, icon: AlertTriangle },
+    { label: 'Already Rate-Limited (429)', v7d: fb7d.rate_limited ?? 0, vDeep: fbDeep.rate_limited ?? 0, icon: Gauge },
   ].filter(r => r.v7d > 0 || r.vDeep > 0);
 
   return (
@@ -273,30 +279,65 @@ function TrafficOverview({ result }: { result: UnifiedResult }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-function RecommendationDisplay({ result }: { result: UnifiedResult }) {
+function RecommendationDisplay({ result, selectedAlgoId, onSelect }: {
+  result: UnifiedResult; selectedAlgoId: string; onSelect: (a: AlgorithmOption) => void;
+}) {
   const rec = result.recommendation;
+  const algos = result.algorithms ?? [];
+  const selected = algos.find(a => a.id === selectedAlgoId) ?? algos[0] ?? {
+    id: 'balanced', label: 'Balanced', formula: '', n: rec.numberOfRequests, b: rec.burstMultiplier,
+    effectiveLimit: rec.effectiveLimit, description: '',
+  } as AlgorithmOption;
   const confColors: Record<string, string> = { high: 'text-emerald-400 bg-emerald-500/20', medium: 'text-amber-400 bg-amber-500/20', low: 'text-red-400 bg-red-500/20' };
   return (
     <div>
+      {/* Algorithm selector */}
+      {algos.length > 0 && (
+        <div className="mb-4">
+          <div className="text-xs text-slate-400 mb-2">Choose an algorithm — the limit, simulator and config below update to match:</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+            {algos.map(a => {
+              const active = a.id === selected.id;
+              return (
+                <button key={a.id} onClick={() => onSelect(a)}
+                  className={`text-left p-3 rounded-lg border transition-colors ${active ? 'bg-blue-500/15 border-blue-500/60' : 'bg-slate-800/50 border-slate-700 hover:border-slate-600'}`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className={`text-xs font-semibold ${active ? 'text-blue-300' : 'text-slate-200'}`}>{a.label}</span>
+                    {a.recommended && <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-bold uppercase">Rec</span>}
+                  </div>
+                  <div className="text-lg font-bold text-slate-100">{a.n}<span className="text-xs text-slate-400 font-normal"> × {a.b} = {a.effectiveLimit}/min</span></div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 font-mono">{a.formula}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="bg-gradient-to-b from-blue-500/10 to-slate-800/50 border border-blue-500/40 rounded-xl p-6 mb-4">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-slate-100">LB-Wide Recommendation</h3>
-          <span className={`px-2 py-0.5 text-xs font-bold rounded uppercase ${confColors[rec.confidence] || confColors.low}`}>{rec.confidence}</span>
+          <h3 className="text-lg font-semibold text-slate-100">{selected.label}</h3>
+          <span className={`px-2 py-0.5 text-xs font-bold rounded uppercase ${confColors[rec.confidence] || confColors.low}`}>{rec.confidence} confidence</span>
         </div>
         <div className="grid grid-cols-3 gap-6 mb-4">
-          <div><div className="text-xs text-slate-400 mb-1">Number (N)</div><div className="text-4xl font-bold text-slate-100">{rec.numberOfRequests}</div><div className="text-sm text-slate-400">req/min</div></div>
-          <div><div className="text-xs text-slate-400 mb-1">Burst (B)</div><div className="text-4xl font-bold text-slate-100">{rec.burstMultiplier}×</div></div>
-          <div><div className="text-xs text-slate-400 mb-1">Effective Limit</div><div className="text-4xl font-bold text-emerald-400">{rec.effectiveLimit}</div><div className="text-sm text-slate-400">req/min peak</div></div>
+          <div><div className="text-xs text-slate-400 mb-1">Number (N)</div><div className="text-4xl font-bold text-slate-100">{selected.n}</div><div className="text-sm text-slate-400">req/min</div></div>
+          <div><div className="text-xs text-slate-400 mb-1">Burst (B)</div><div className="text-4xl font-bold text-slate-100">{selected.b}×</div></div>
+          <div><div className="text-xs text-slate-400 mb-1">Effective Limit</div><div className="text-4xl font-bold text-emerald-400">{selected.effectiveLimit}</div><div className="text-sm text-slate-400">req/min peak</div></div>
         </div>
-        <div className="text-sm text-slate-300 leading-relaxed space-y-3">
-          {rec.rationale.split('\n\n').map((p, i) => <p key={i}>{p}</p>)}
-        </div>
+        {selected.description && <p className="text-sm text-slate-300 leading-relaxed mb-3">{selected.description}</p>}
+        {selected.id === 'balanced' ? (
+          <div className="text-sm text-slate-300 leading-relaxed space-y-3 border-t border-slate-700/50 pt-3">
+            {rec.rationale.split('\n\n').map((p, i) => <p key={i}>{p}</p>)}
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500 border-t border-slate-700/50 pt-3">Switch to <span className="text-blue-400">Balanced</span> for the full per-user statistical breakdown. Use the Impact Simulator below to see exactly who this limit would affect.</p>
+        )}
       </div>
       <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4 text-xs">
         <h4 className="text-slate-200 font-semibold mb-2">How to apply in F5 XC Console</h4>
         <ol className="list-decimal list-inside text-slate-400 space-y-1">
           <li>HTTP Load Balancer → <code className="text-slate-300">{result.lbName}</code> → Rate Limiting → Custom Rate Limiting Parameters</li>
-          <li>Number = <code className="text-blue-300">{rec.numberOfRequests}</code>, Per Period = <code className="text-blue-300">Minutes</code>, Periods = <code className="text-blue-300">1</code>, Burst = <code className="text-blue-300">{rec.burstMultiplier}</code></li>
+          <li>Number = <code className="text-blue-300">{selected.n}</code>, Per Period = <code className="text-blue-300">Minutes</code>, Periods = <code className="text-blue-300">1</code>, Burst = <code className="text-blue-300">{selected.b}</code></li>
           <li>Mitigation Action = <code className="text-amber-300">None</code> (alert-only for first week)</li>
         </ol>
       </div>
@@ -318,10 +359,11 @@ function UserStats({ result }: { result: UnifiedResult }) {
   ];
   return (
     <div>
+      <p className="text-[11px] text-slate-500 mb-2">Peak = max requests in any rolling 60-second window per user (token-bucket view; bursts that cross a clock-minute boundary are not undercounted). Counts are de-sampled.</p>
       <div className="bg-slate-800/50 rounded-lg overflow-hidden mb-4">
         <table className="w-full text-sm"><thead><tr className="border-b border-slate-700">
           <th className="text-left px-4 py-2 text-slate-400 font-medium">Percentile</th>
-          <th className="text-right px-4 py-2 text-slate-400 font-medium">Per-User Peak (req/min)</th>
+          <th className="text-right px-4 py-2 text-slate-400 font-medium">Per-User Peak (rolling 60s)</th>
         </tr></thead><tbody>{rows.map(r => (
           <tr key={r.label} className={`border-b border-slate-700/50 ${r.highlight ? 'bg-blue-500/5' : ''}`}>
             <td className={`px-4 py-2 font-medium ${r.highlight ? 'text-blue-400' : 'text-slate-200'}`}>{r.label}</td>
@@ -361,7 +403,7 @@ function ImpactSim({ impact, rec, sliderValue, onSlider, burst, onBurst, showExp
   sliderValue: number; onSlider: (v: number) => void; burst: number; onBurst: (v: number) => void;
   showExplainer: boolean; onToggleExplainer: () => void;
 }) {
-  const sliderMax = Math.max(rec.numberOfRequests * 3, 500);
+  const sliderMax = Math.max(rec.numberOfRequests * 3, sliderValue, 500);
   const isClean = impact ? impact.usersAffected === 0 : true;
   return (
     <div>
