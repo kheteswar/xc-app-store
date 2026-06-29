@@ -7,11 +7,9 @@
  *   GET  /api/fp-analyzer/summary/:id       → Get summary table (after summary_ready)
  *   GET  /api/fp-analyzer/detail/:id/signature/:sigId     → Get signature detail (on-demand)
  *   GET  /api/fp-analyzer/detail/:id/violation/:name      → Get violation detail (on-demand)
- *   GET  /api/fp-analyzer/detail/:id/threat-mesh/:srcIp   → Get threat mesh IP detail (on-demand)
- *   POST /api/fp-analyzer/enrich/:id/signature/:sigId     → Enrich signature with access logs
- *   POST /api/fp-analyzer/enrich/:id/threat-mesh/:srcIp   → Enrich threat mesh IP with access logs
- *   POST /api/fp-analyzer/exclusion/:id     → Generate exclusion policy for confirmed FPs
- *   POST /api/fp-analyzer/cancel/:id        → Cancel a running job
+ *   POST /api/fp-analyzer/exclusion/:id        → Generate exclusion policy for confirmed FPs
+ *   POST /api/fp-analyzer/apply-exclusion/:id  → Stage exclusion policy into the tenant (unattached)
+ *   POST /api/fp-analyzer/cancel/:id           → Cancel a running job
  */
 
 import type { Plugin } from 'vite';
@@ -80,15 +78,16 @@ export function fpAnalyzerPlugin(): Plugin {
             return;
           }
 
+          const scopes = (parsed.scopes || ['waf_signatures', 'waf_violations'])
+            .filter(s => s === 'waf_signatures' || s === 'waf_violations');
           const config: ProgressiveJobConfig = {
             tenant: parsed.tenant,
             token: parsed.token,
             namespace: parsed.namespace,
             lbName: parsed.lbName,
             domains: parsed.domains || [],
-            scopes: parsed.scopes || ['waf_signatures', 'waf_violations', 'threat_mesh', 'service_policy'],
+            scopes: scopes.length ? scopes : ['waf_signatures', 'waf_violations'],
             hoursBack: parsed.hoursBack || 168,
-            mode: parsed.mode || 'quick',
           };
 
           const jobId = generateJobId();
@@ -99,7 +98,7 @@ export function fpAnalyzerPlugin(): Plugin {
             console.error(`[FPAnalyzer] Job ${jobId} unhandled error:`, err);
           });
 
-          console.log(`[FPAnalyzer] Job ${jobId} started (mode=${config.mode})`);
+          console.log(`[FPAnalyzer] Job ${jobId} started`);
           sendJSON(res, 200, { jobId });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -170,56 +169,12 @@ export function fpAnalyzerPlugin(): Plugin {
           const detail = job.getViolationDetail(id);
           if (!detail) { sendJSON(res, 404, { error: `Violation ${id} not found` }); return; }
           sendJSON(res, 200, detail);
-        } else if (type === 'threat-mesh') {
-          const detail = job.getThreatMeshDetail(id);
-          if (!detail) { sendJSON(res, 404, { error: `Threat mesh IP ${id} not found` }); return; }
-          sendJSON(res, 200, detail);
         } else {
           sendJSON(res, 400, { error: `Unknown detail type: ${type}` });
         }
       });
 
-      // ── Enrich with Access Logs ──
-      server.middlewares.use('/api/fp-analyzer/enrich/', async (req: IncomingMessage, res: ServerResponse, next) => {
-        if (req.method !== 'POST') return next();
-
-        try {
-          // URL: /{jobId}/signature/{sigId} or /{jobId}/threat-mesh/{srcIp}
-          const segments = getPathSegments(req.url || '');
-          if (segments.length < 3) { sendJSON(res, 400, { error: 'Invalid URL format' }); return; }
-
-          const jobId = segments[0];
-          const type = segments[1]; // "signature" or "threat-mesh"
-          const id = decodeURIComponent(segments.slice(2).join('/'));
-
-          const job = jobs.get(jobId);
-          if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-
-          if (type === 'signature') {
-            const body = await parseBody(req);
-            const parsed = JSON.parse(body) as { paths?: string[] };
-            const paths = parsed.paths || [];
-
-            if (paths.length === 0) {
-              sendJSON(res, 400, { error: 'No paths specified for enrichment' });
-              return;
-            }
-
-            const result = await job.enrichSignature(id, paths);
-            if (!result) { sendJSON(res, 404, { error: `Signature ${id} not found` }); return; }
-            sendJSON(res, 200, result);
-          } else if (type === 'threat-mesh') {
-            const result = await job.enrichThreatMeshIP(id);
-            if (!result) { sendJSON(res, 404, { error: `Threat mesh IP ${id} not found` }); return; }
-            sendJSON(res, 200, result);
-          } else {
-            sendJSON(res, 400, { error: `Unknown enrich type: ${type}` });
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          sendJSON(res, 500, { error: `Enrichment failed: ${msg}` });
-        }
-      });
+      // (On-demand enrichment removed — per-IP behavior is collected automatically before scoring.)
 
       // ── Generate Exclusion Policy ──
       server.middlewares.use('/api/fp-analyzer/exclusion/', async (req: IncomingMessage, res: ServerResponse, next) => {
@@ -249,6 +204,31 @@ export function fpAnalyzerPlugin(): Plugin {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           sendJSON(res, 500, { error: `Exclusion generation failed: ${msg}` });
+        }
+      });
+
+      // ── Stage Exclusion Policy to Tenant (creates an UNATTACHED config object) ──
+      server.middlewares.use('/api/fp-analyzer/apply-exclusion/', async (req: IncomingMessage, res: ServerResponse, next) => {
+        if (req.method !== 'POST') return next();
+
+        try {
+          const segments = getPathSegments(req.url || '');
+          const jobId = segments[0];
+          if (!jobId) { sendJSON(res, 400, { error: 'Missing job ID' }); return; }
+
+          const job = jobs.get(jobId);
+          if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
+
+          const body = await parseBody(req);
+          const parsed = JSON.parse(body) as { sigIds?: string[] };
+          const sigIds = parsed.sigIds || [];
+          if (sigIds.length === 0) { sendJSON(res, 400, { error: 'No signature IDs specified' }); return; }
+
+          const result = await job.applyExclusionPolicy(sigIds);
+          sendJSON(res, result.created ? 200 : 502, result);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          sendJSON(res, 500, { error: `Apply failed: ${msg}` });
         }
       });
 

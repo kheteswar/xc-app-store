@@ -1,0 +1,20 @@
+{
+  "//": "Full-project typecheck (src + server). Root tsconfig.json excludes server/, so use `npm run typecheck` to check the FP-analyzer dev-server engine too.",
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "//include": "vite.config.ts is excluded — it's bundled by Vite's own esbuild (not tsc) and has pre-existing node-stream typing noise unrelated to app/server source.",
+  "include": ["src", "server"]
+}

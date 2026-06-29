@@ -1,4 +1,6 @@
 import type { SignalScore, PathStats, QuickVerdict, ConfidenceLevel, SignatureSummary } from './types';
+import { scoreAiRisk, isStagedState, isAutoSuppressedState } from './ai-signals';
+import type { AiSignalInput } from './ai-signals';
 
 // ═══════════════════════════════════════════════════════════════
 // SIGNAL 1: USER BREADTH (weight 25%)
@@ -7,11 +9,14 @@ import type { SignalScore, PathStats, QuickVerdict, ConfidenceLevel, SignatureSu
 export function scoreUserBreadth(flaggedUsers: number, totalUsers: number): SignalScore {
   if (totalUsers === 0) return { score: 50, rawValue: 0, reason: 'No access log data for this path' };
 
-  if (flaggedUsers <= 2) {
-    return { score: 5, rawValue: flaggedUsers, reason: `Only ${flaggedUsers} user(s) triggered this — likely targeted` };
+  // "Few users = targeted attack" only holds on a busy path. On a low-traffic
+  // path, 2/2 users is 100% breadth — a strong FP signal, not a targeted TP.
+  if (flaggedUsers <= 2 && totalUsers > 10) {
+    return { score: 5, rawValue: flaggedUsers, reason: `Only ${flaggedUsers} of ${totalUsers} users triggered this — likely targeted` };
   }
 
-  const ratio = flaggedUsers / totalUsers;
+  // Clamp: sampled access-log denominators can make flagged > total.
+  const ratio = Math.min(1, flaggedUsers / totalUsers);
   if (ratio > 0.80) return { score: 95, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of users trigger this — very strong FP` };
   if (ratio > 0.50) return { score: 80, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of users trigger this — strong FP` };
   if (ratio > 0.30) return { score: 60, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of users trigger this — moderate FP` };
@@ -27,7 +32,9 @@ export function scoreUserBreadth(flaggedUsers: number, totalUsers: number): Sign
 export function scoreRequestBreadth(flaggedRequests: number, totalRequests: number): SignalScore {
   if (totalRequests === 0) return { score: 50, rawValue: 0, reason: 'No access log data for this path' };
 
-  const ratio = flaggedRequests / totalRequests;
+  // Clamp: security events (numerator) are unsampled but access logs (denominator)
+  // are sampled, so the raw ratio can exceed 1 — cap it before bucketing.
+  const ratio = Math.min(1, flaggedRequests / totalRequests);
   if (ratio > 0.90) return { score: 95, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of requests trigger this — very strong FP` };
   if (ratio > 0.70) return { score: 85, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of requests trigger this — strong FP` };
   if (ratio > 0.50) return { score: 70, rawValue: ratio, reason: `${(ratio * 100).toFixed(0)}% of requests trigger this — moderate FP` };
@@ -132,18 +139,23 @@ export function scoreClientProfile(
     }
   }
 
-  // Sub-check B: Bot classifications
+  // Sub-check B: Bot classifications (Malicious / Suspicious / Benign per F5 bot_info)
   const botEntries = Object.entries(flaggedBotClassifications);
   if (botEntries.length > 0) {
     let maliciousCount = 0;
+    let suspiciousCount = 0;
     let totalBot = 0;
     for (const [cls, count] of botEntries) {
       totalBot += count;
       if (/malicious/i.test(cls)) maliciousCount += count;
+      else if (/suspicious/i.test(cls)) suspiciousCount += count;
     }
     if (maliciousCount > 0 && totalBot > 0 && (maliciousCount / totalBot) > 0.5) {
       score -= 30;
       reasons.push(`${maliciousCount}/${totalBot} bot classifications are malicious`);
+    } else if (suspiciousCount > 0 && totalBot > 0 && (suspiciousCount / totalBot) > 0.5) {
+      score -= 12;
+      reasons.push(`${suspiciousCount}/${totalBot} bot classifications are suspicious`);
     }
   }
 
@@ -230,20 +242,31 @@ export function scoreSignatureAccuracy(
   state: string,
   aiConfirmed: boolean,
   violationRatings: number[],
+  aiInput?: AiSignalInput,
 ): SignalScore {
   let score = 50;
   const reasons: string[] = [];
 
-  // AI confirmation overrides strongly toward TP
-  if (aiConfirmed) {
+  // AI-WAF intelligence (req_risk, risk reasons, recommended_action). When the
+  // structured AI input is available it supersedes the legacy aiConfirmed flag.
+  if (aiInput) {
+    const ai = scoreAiRisk(aiInput);
+    score += ai.delta;
+    reasons.push(...ai.reasons);
+  } else if (aiConfirmed) {
     score -= 40;
     reasons.push('AI confirmed 100% — very unlikely FP');
   }
 
-  // AutoSuppressed = F5 ML thinks it's FP
-  if (state === 'AutoSuppressed') {
+  // AutoSuppressed = F5 ML already treating this as FP
+  if (isAutoSuppressedState(state)) {
     score += 30;
-    reasons.push('AutoSuppressed by F5 ML');
+    reasons.push('AutoSuppressed by F5 ML — already treated as FP');
+  }
+  // Staged = monitor-only; the signature is not actually blocking yet
+  if (isStagedState(state)) {
+    score += 10;
+    reasons.push('Signature is in Staging (monitor-only) — not enforced');
   }
 
   // Accuracy
@@ -341,14 +364,23 @@ export function scoreSignatureAccuracyEnhanced(
   violationRatings: number[],
   calculatedAction?: string,
   rspCode200Pct?: number,
+  aiInput?: AiSignalInput,
 ): SignalScore {
   let score = 50;
   const reasons: string[] = [];
 
-  if (aiConfirmed) { score -= 40; reasons.push('AI confirmed — very unlikely FP'); }
-  if (state === 'AutoSuppressed') { score += 35; reasons.push('AutoSuppressed by F5 ML'); }
-  if (calculatedAction === 'report') { score += 10; reasons.push('WAF calculated_action=report (not confident)'); }
-  if (calculatedAction === 'block') { score -= 10; reasons.push('WAF calculated_action=block (confident)'); }
+  // AI-WAF intelligence supersedes the legacy aiConfirmed + bare calculated_action.
+  if (aiInput) {
+    const ai = scoreAiRisk(aiInput);
+    score += ai.delta;
+    reasons.push(...ai.reasons);
+  } else {
+    if (aiConfirmed) { score -= 40; reasons.push('AI confirmed — very unlikely FP'); }
+    if (calculatedAction === 'report') { score += 10; reasons.push('WAF calculated_action=report (not confident)'); }
+    if (calculatedAction === 'block') { score -= 10; reasons.push('WAF calculated_action=block (confident)'); }
+  }
+  if (isAutoSuppressedState(state)) { score += 35; reasons.push('AutoSuppressed by F5 ML — already treated as FP'); }
+  if (isStagedState(state)) { score += 10; reasons.push('Signature in Staging (monitor-only) — not enforced'); }
   if (accuracy === 'high_accuracy') { score -= 15; reasons.push('High accuracy signature'); }
   else if (accuracy === 'low_accuracy') { score += 20; reasons.push('Low accuracy signature'); }
   if (rspCode200Pct !== undefined && rspCode200Pct > 0.80) { score += 15; reasons.push('Origin accepted >80% of requests'); }
@@ -387,17 +419,19 @@ export function scoreClientProfileQuick(
     else if (pct < 0.20) { score -= 25; reasons.push('Mostly scripting tools'); }
   }
 
-  // Bot classifications
+  // Bot classifications (Malicious / Suspicious / Benign per F5 bot_info)
   const botEntries = Object.entries(botClassifications);
   if (botEntries.length > 0) {
-    let malicious = 0; let benign = 0; let total = 0;
+    let malicious = 0; let suspicious = 0; let benign = 0; let total = 0;
     for (const [cls, count] of botEntries) {
       total += count;
       if (/malicious/i.test(cls)) malicious += count;
-      if (/benign/i.test(cls)) benign += count;
+      else if (/suspicious/i.test(cls)) suspicious += count;
+      else if (/benign/i.test(cls)) benign += count;
     }
     if (benign > 0 && total > 0 && benign / total > 0.5) { score += 30; reasons.push('Mostly benign bots being flagged'); }
     if (malicious > 0 && total > 0 && malicious / total > 0.5) { score -= 30; reasons.push('Mostly malicious bots'); }
+    else if (suspicious > 0 && total > 0 && suspicious / total > 0.5) { score -= 12; reasons.push('Mostly suspicious bots'); }
   }
 
   // Bot anomaly reasons

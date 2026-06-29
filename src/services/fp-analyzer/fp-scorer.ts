@@ -1,4 +1,5 @@
 import type { SignalResult, FPVerdict, AnalysisMode } from './types';
+import type { AiRiskCounts, RiskReasonVerdict, AiSignalInput } from './ai-signals';
 import {
   scoreUserBreadth,
   scoreRequestBreadth,
@@ -38,6 +39,11 @@ export interface ComputeSignalsInput {
   sigState: string;
   aiConfirmed: boolean;
   violationRatings: number[];
+  // AI-WAF intelligence (optional — present when events carry req_risk* fields)
+  aiRiskCounts?: AiRiskCounts;
+  aiReasonVerdict?: RiskReasonVerdict;
+  recommendedAction?: string;
+  calculatedAction?: string;
 }
 
 const WEIGHTS = {
@@ -63,11 +69,21 @@ export function computeAllSignals(input: ComputeSignalsInput): SignalResult {
     input.normalCountries,
   );
   const temporalPattern = scoreTemporalPattern(input.timestamps, input.normalTimestamps);
+  const aiInput: AiSignalInput | undefined =
+    input.aiRiskCounts || input.aiReasonVerdict || input.recommendedAction || input.calculatedAction
+      ? {
+          riskCounts: input.aiRiskCounts,
+          reasonVerdict: input.aiReasonVerdict,
+          recommendedAction: input.recommendedAction,
+          calculatedAction: input.calculatedAction,
+        }
+      : undefined;
   const signatureAccuracy = scoreSignatureAccuracy(
     input.accuracy,
     input.sigState,
     input.aiConfirmed,
     input.violationRatings,
+    aiInput,
   );
 
   const compositeScore = Math.round(
@@ -127,6 +143,10 @@ export interface QuickModeSignalsInput {
   violationRatings: number[];
   calculatedAction?: string;
   rspCode200Pct: number;
+  // AI-WAF intelligence (optional — present when events carry req_risk* fields)
+  aiRiskCounts?: AiRiskCounts;
+  aiReasonVerdict?: RiskReasonVerdict;
+  recommendedAction?: string;
 }
 
 export function computeQuickModeSignals(input: QuickModeSignalsInput): SignalResult {
@@ -142,6 +162,15 @@ export function computeQuickModeSignals(input: QuickModeSignalsInput): SignalRes
     input.botAnomalies,
   );
   const temporalPattern = scoreTemporalPattern(input.timestamps, []);
+  const aiInput: AiSignalInput | undefined =
+    input.aiRiskCounts || input.aiReasonVerdict || input.recommendedAction || input.calculatedAction
+      ? {
+          riskCounts: input.aiRiskCounts,
+          reasonVerdict: input.aiReasonVerdict,
+          recommendedAction: input.recommendedAction,
+          calculatedAction: input.calculatedAction,
+        }
+      : undefined;
   const signatureAccuracy = scoreSignatureAccuracyEnhanced(
     input.accuracy,
     input.sigState,
@@ -149,6 +178,7 @@ export function computeQuickModeSignals(input: QuickModeSignalsInput): SignalRes
     input.violationRatings,
     input.calculatedAction,
     input.rspCode200Pct,
+    aiInput,
   );
 
   const compositeScore = Math.round(

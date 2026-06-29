@@ -2,8 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ShieldAlert, Play, ChevronDown, ChevronRight, AlertTriangle,
-  Globe, Target, Lock, Check, XCircle,
-  ArrowLeft, ArrowRight, Zap, BarChart3,
+  Globe, Target, Lock, Check, XCircle, Bot,
+  ArrowLeft, ArrowRight,
   Download, FileSpreadsheet, HelpCircle,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -20,7 +20,7 @@ import {
   cleanPolicyForExport,
 } from '../services/fp-analyzer';
 import type {
-  AnalysisScope, AnalysisMode, FPVerdict, QuickVerdict, ConfidenceLevel,
+  AnalysisScope, FPVerdict, QuickVerdict, ConfidenceLevel,
   SignatureAnalysisUnit,
   ViolationAnalysisUnit,
   ThreatMeshAnalysisUnit,
@@ -198,10 +198,8 @@ function Section({ title, icon: Icon, expanded, onToggle, badge, children }: {
 // SIGNATURE DETAIL VIEW
 // ═══════════════════════════════════════════════════════════════
 
-function SignatureDetailView({ unit, onEnrich, enriching, onBack, onPrev, onNext, currentIdx, totalCount, onMarkFP, onMarkTP }: {
+function SignatureDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCount, onMarkFP, onMarkTP }: {
   unit: SignatureAnalysisUnit;
-  onEnrich: (paths: string[]) => void;
-  enriching: boolean;
   onBack: () => void;
   onPrev: () => void;
   onNext: () => void;
@@ -213,13 +211,13 @@ function SignatureDetailView({ unit, onEnrich, enriching, onBack, onPrev, onNext
   const signals = unit.signals;
 
   const signalList = [
-    { label: 'User Breadth', weight: '20%', score: signals.userBreadth.score, reason: signals.userBreadth.reason },
-    { label: 'Request Breadth', weight: '15%', score: signals.requestBreadth.score, reason: signals.requestBreadth.reason },
-    { label: 'Path Breadth', weight: '15%', score: signals.pathBreadth.score, reason: signals.pathBreadth.reason },
-    { label: 'Context Analysis', weight: '15%', score: signals.contextAnalysis.score, reason: signals.contextAnalysis.reason },
-    { label: 'Client Profile', weight: '10%', score: signals.clientProfile.score, reason: signals.clientProfile.reason },
-    { label: 'Temporal Pattern', weight: '10%', score: signals.temporalPattern.score, reason: signals.temporalPattern.reason },
-    { label: 'Signature Accuracy', weight: '15%', score: signals.signatureAccuracy.score, reason: signals.signatureAccuracy.reason },
+    { label: 'Client Breadth', weight: '15%', score: signals.clientBreadth.score, reason: signals.clientBreadth.reason },
+    { label: 'Path Breadth', weight: '10%', score: signals.pathBreadth.score, reason: signals.pathBreadth.reason },
+    { label: 'Context', weight: '10%', score: signals.context.score, reason: signals.context.reason },
+    { label: 'Matching Evidence', weight: '15%', score: signals.matchingEvidence.score, reason: signals.matchingEvidence.reason },
+    { label: 'Origin Response', weight: '15%', score: signals.originResponse.score, reason: signals.originResponse.reason },
+    { label: 'Client Behavior', weight: '20%', score: signals.clientBehavior.score, reason: signals.clientBehavior.reason },
+    { label: 'Detection Confidence', weight: '15%', score: signals.detectionConfidence.score, reason: signals.detectionConfidence.reason },
   ];
 
   // Fix: use pathCounts directly instead of re-counting rawPaths
@@ -304,7 +302,7 @@ function SignatureDetailView({ unit, onEnrich, enriching, onBack, onPrev, onNext
       {/* Signals */}
       <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5 mb-4">
         <h4 className="text-sm font-semibold text-slate-200 mb-3">
-          {unit.enriched ? 'Deep Mode Signals' : 'Quick Mode Signals'} (from security events)
+          FP Signals {unit.ipProfiles && unit.ipProfiles.length > 0 ? `(incl. behavior of ${unit.ipProfiles.length} client IPs)` : ''}
         </h4>
         {signalList.map((s, i) => <SignalBar key={i} label={s.label} score={s.score} reason={s.reason} weight={s.weight} />)}
       </div>
@@ -507,23 +505,6 @@ function SignatureDetailView({ unit, onEnrich, enriching, onBack, onPrev, onNext
         </div>
       )}
 
-      {/* Enrich with access logs */}
-      {!unit.enriched && (
-        <div className="bg-slate-800/50 border border-blue-700/50 rounded-xl p-5 mb-4">
-          <h4 className="text-sm font-semibold text-blue-300 mb-2">Optional: Load Access Logs for Precision</h4>
-          <p className="text-xs text-slate-400 mb-3">
-            Fetch access logs for the {unit.pathCount} paths where this signature triggers
-            to compute exact ratios (% of users affected).
-          </p>
-          <button
-            onClick={() => onEnrich(unit.rawPaths.slice(0, 15))}
-            disabled={enriching}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-600 text-white rounded-lg text-sm transition-colors"
-          >
-            {enriching ? 'Loading Access Logs...' : 'Load Access Logs for This Signature'}
-          </button>
-        </div>
-      )}
 
       {/* Actions */}
       <div className="flex items-center gap-3 mt-4">
@@ -553,11 +534,13 @@ function ViolationDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCo
   const signals = unit.signals;
 
   const signalList = [
-    { label: 'User Breadth', weight: '30%', score: signals.userBreadth.score, reason: signals.userBreadth.reason },
-    { label: 'Request Breadth', weight: '20%', score: signals.requestBreadth.score, reason: signals.requestBreadth.reason },
-    { label: 'Path Breadth', weight: '20%', score: signals.pathBreadth.score, reason: signals.pathBreadth.reason },
-    { label: 'Context Analysis', weight: '15%', score: signals.contextAnalysis.score, reason: signals.contextAnalysis.reason },
-    { label: 'Client Profile', weight: '15%', score: signals.clientProfile.score, reason: signals.clientProfile.reason },
+    { label: 'Client Breadth', weight: '15%', score: signals.clientBreadth.score, reason: signals.clientBreadth.reason },
+    { label: 'Path Breadth', weight: '10%', score: signals.pathBreadth.score, reason: signals.pathBreadth.reason },
+    { label: 'Context', weight: '10%', score: signals.context.score, reason: signals.context.reason },
+    { label: 'Matching Evidence', weight: '15%', score: signals.matchingEvidence.score, reason: signals.matchingEvidence.reason },
+    { label: 'Origin Response', weight: '15%', score: signals.originResponse.score, reason: signals.originResponse.reason },
+    { label: 'Client Behavior', weight: '20%', score: signals.clientBehavior.score, reason: signals.clientBehavior.reason },
+    { label: 'Violation Severity', weight: '15%', score: signals.detectionConfidence.score, reason: signals.detectionConfidence.reason },
   ];
 
   const topPaths = Object.entries(unit.pathCounts || {})
@@ -1036,8 +1019,7 @@ export default function FPAnalyzer() {
 
   // ── Analysis config ──
   const [hoursBack, setHoursBack] = useState(168);
-  const [mode, setMode] = useState<AnalysisMode>('quick');
-  const [scopes, setScopes] = useState<AnalysisScope[]>(['waf_signatures', 'waf_violations', 'threat_mesh', 'service_policy']);
+  const [scopes, setScopes] = useState<AnalysisScope[]>(['waf_signatures', 'waf_violations']);
   const [configExpanded, setConfigExpanded] = useState(true);
 
   // ── Job state ──
@@ -1050,7 +1032,6 @@ export default function FPAnalyzer() {
   const [summary, setSummary] = useState<SummaryResult | null>(null);
   const [selectedSigId, setSelectedSigId] = useState<string | null>(null);
   const [sigDetail, setSigDetail] = useState<SignatureAnalysisUnit | null>(null);
-  const [enriching, setEnriching] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
 
   // ── Violation Detail ──
@@ -1077,9 +1058,12 @@ export default function FPAnalyzer() {
   // ── Export ──
   const [copied, setCopied] = useState(false);
   const [generatingPolicy, setGeneratingPolicy] = useState(false);
+  const [stagingPolicy, setStagingPolicy] = useState(false);
 
   // ── Section expansion ──
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    wafComparison: true,
+    botAnalysis: true,
     signatures: true,
     violations: true,
     threatMesh: true,
@@ -1156,7 +1140,6 @@ export default function FPAnalyzer() {
           domains,
           scopes,
           hoursBack,
-          mode,
         }),
       });
       const data = await res.json();
@@ -1172,35 +1155,16 @@ export default function FPAnalyzer() {
           const prog: ProgressiveJobProgress = await pRes.json();
           setProgress(prog);
 
-          if ((prog.status === 'summary_ready' || prog.status === 'enriching' || prog.status === 'complete') && !summaryFetched) {
-            // Summary is ready — fetch it and show to user
+          // Single-pass redesign: the summary is fully scored only when the job
+          // completes (after per-IP behavioral enrichment). Fetch it once at the end.
+          if (prog.status === 'complete' && !summaryFetched) {
             summaryFetched = true;
+            if (pollRef.current) clearInterval(pollRef.current);
+            pollRef.current = null;
             const sRes = await fetch(`/api/fp-analyzer/summary/${data.jobId}`);
             const summaryData: SummaryResult = await sRes.json();
             setSummary(summaryData);
             setPhase('summary');
-          }
-
-          // Check if any enrichment is still ongoing (hybrid or TM-only)
-          const hybridEnriching = prog.hybridEnrichPhase && prog.hybridEnrichPhase !== 'complete';
-          const tmEnriching = prog.tmEnrichTotal && prog.tmEnrichTotal > 0 && prog.tmEnrichCompleted !== undefined && prog.tmEnrichCompleted < prog.tmEnrichTotal;
-          const anyEnriching = hybridEnriching || tmEnriching;
-
-          // Re-fetch summary periodically during enrichment to show updated scores
-          if (summaryFetched && anyEnriching) {
-            const sRes = await fetch(`/api/fp-analyzer/summary/${data.jobId}`);
-            const updatedSummary: SummaryResult = await sRes.json();
-            setSummary(updatedSummary);
-          }
-
-          if (summaryFetched && !anyEnriching && prog.status === 'complete') {
-            // Everything done — final re-fetch and stop polling
-            if (pollRef.current) clearInterval(pollRef.current);
-            pollRef.current = null;
-
-            const sRes = await fetch(`/api/fp-analyzer/summary/${data.jobId}`);
-            const updatedSummary: SummaryResult = await sRes.json();
-            setSummary(updatedSummary);
           }
 
           if (prog.status === 'error') {
@@ -1217,7 +1181,7 @@ export default function FPAnalyzer() {
       toast.error(err instanceof Error ? err.message : 'Failed to start analysis');
       setPhase('idle');
     }
-  }, [selectedNs, selectedLb, tenant, domains, scopes, hoursBack, mode, toast]);
+  }, [selectedNs, selectedLb, tenant, domains, scopes, hoursBack, toast]);
 
   // ═══════════════════════════════════════════════════════════════
   // SELECT SIGNATURE → LOAD DETAIL
@@ -1244,30 +1208,6 @@ export default function FPAnalyzer() {
   // ═══════════════════════════════════════════════════════════════
   // ENRICH WITH ACCESS LOGS
   // ═══════════════════════════════════════════════════════════════
-
-  const enrichSignature = useCallback(async (paths: string[]) => {
-    if (!jobId || !selectedSigId) return;
-    setEnriching(true);
-
-    try {
-      const res = await fetch(`/api/fp-analyzer/enrich/${jobId}/signature/${selectedSigId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths }),
-      });
-      await res.json(); // EnrichmentResult
-
-      // Reload the detail
-      const detRes = await fetch(`/api/fp-analyzer/detail/${jobId}/signature/${selectedSigId}`);
-      const updated: SignatureAnalysisUnit = await detRes.json();
-      setSigDetail(updated);
-      toast.success('Access logs loaded — signals updated');
-    } catch (err) {
-      toast.error('Failed to load access logs');
-    } finally {
-      setEnriching(false);
-    }
-  }, [jobId, selectedSigId, toast]);
 
   // ═══════════════════════════════════════════════════════════════
   // SELECT VIOLATION → LOAD DETAIL
@@ -1401,7 +1341,6 @@ export default function FPAnalyzer() {
         scopes,
         namespace: selectedNs,
         lbName: selectedLb,
-        mode,
         threatMeshDetails: tmDetails,
         signatureDetails: sigDetails,
         violationDetails: violDetails,
@@ -1413,7 +1352,7 @@ export default function FPAnalyzer() {
     } finally {
       setExportingPdf(false);
     }
-  }, [summary, scopes, selectedNs, selectedLb, mode, fetchAllDetails, buildExclusionPolicy, toast]);
+  }, [summary, scopes, selectedNs, selectedLb, fetchAllDetails, buildExclusionPolicy, toast]);
 
   const downloadExcel = useCallback(async () => {
     if (!summary) return;
@@ -1426,7 +1365,6 @@ export default function FPAnalyzer() {
         scopes,
         namespace: selectedNs,
         lbName: selectedLb,
-        mode,
         threatMeshDetails: tmDetails,
         signatureDetails: sigDetails,
         violationDetails: violDetails,
@@ -1436,7 +1374,7 @@ export default function FPAnalyzer() {
     } catch {
       toast.error('Failed to generate Excel');
     }
-  }, [summary, scopes, selectedNs, selectedLb, mode, fetchAllDetails, buildExclusionPolicy, toast]);
+  }, [summary, scopes, selectedNs, selectedLb, fetchAllDetails, buildExclusionPolicy, toast]);
 
   const downloadExclusionPolicy = useCallback(async () => {
     if (!summary || !jobId) return;
@@ -1526,7 +1464,7 @@ export default function FPAnalyzer() {
     if (!summary) return;
     const updates: Record<string, 'confirmed_fp'> = {};
     for (const sig of summary.signatures) {
-      if (sig.quickVerdict === 'likely_fp' && sig.quickConfidence === 'high') {
+      if (sig.fpVerdict === 'highly_likely_fp') {
         updates[sig.sigId] = 'confirmed_fp';
       }
     }
@@ -1564,6 +1502,44 @@ export default function FPAnalyzer() {
       setGeneratingPolicy(false);
     }
   }, [jobId, reviewStatus, toast]);
+
+  const stageExclusionToTenant = useCallback(async () => {
+    if (!jobId) return;
+    const confirmedFPIds = Object.entries(reviewStatus)
+      .filter(([, status]) => status === 'confirmed_fp')
+      .map(([sigId]) => sigId);
+
+    if (confirmedFPIds.length === 0) {
+      toast.error('No signatures marked as confirmed FP');
+      return;
+    }
+
+    // Outward-facing tenant write — confirm first. Policy is created UNATTACHED.
+    const ok = window.confirm(
+      `Create a WAF exclusion policy from ${confirmedFPIds.length} confirmed FP signature(s) in namespace "${selectedNs}"?\n\n` +
+      `The policy is created as a config object but NOT attached to the load balancer — it has no enforcement effect until you review and attach it in the F5 XC console.`,
+    );
+    if (!ok) return;
+
+    setStagingPolicy(true);
+    try {
+      const res = await fetch(`/api/fp-analyzer/apply-exclusion/${jobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sigIds: confirmedFPIds }),
+      });
+      const result = await res.json();
+      if (result.created) {
+        toast.success(`Created policy "${result.name}" (${result.ruleCount} rules, unattached) in ${result.namespace}. Attach it in the XC console to enforce.`);
+      } else {
+        toast.error(`Could not create policy: ${result.error || 'unknown error'}`);
+      }
+    } catch (err) {
+      toast.error('Failed to reach tenant');
+    } finally {
+      setStagingPolicy(false);
+    }
+  }, [jobId, reviewStatus, selectedNs, toast]);
 
   // ═══════════════════════════════════════════════════════════════
   // RENDER
@@ -1619,36 +1595,12 @@ export default function FPAnalyzer() {
         <div className="mb-4">
           <label className="block text-xs text-slate-400 mb-1">Time Range</label>
           <div className="flex gap-2">
-            {[24, 48, 72, 168, 336].map(h => (
+            {[24, 48, 72, 168, 336, 720].map(h => (
               <button key={h} onClick={() => setHoursBack(h)} disabled={phase !== 'idle'}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${hoursBack === h
                   ? 'bg-blue-600/30 border-blue-500 text-blue-300'
                   : 'bg-slate-800 border-slate-600 text-slate-300 hover:border-slate-500'}`}
               >{h <= 72 ? `${h}h` : `${h / 24}d`}</button>
-            ))}
-          </div>
-        </div>
-
-        {/* Mode selector */}
-        <div className="mb-4">
-          <label className="block text-xs text-slate-400 mb-1">Analysis Mode</label>
-          <div className="grid grid-cols-2 gap-3">
-            {([
-              { value: 'quick' as AnalysisMode, label: 'Quick Mode', desc: 'Security events only', time: '~30-120 sec', icon: Zap },
-              { value: 'hybrid' as AnalysisMode, label: 'Hybrid Mode', desc: 'Security + access logs (background)', time: '~3-15 min', icon: BarChart3 },
-            ]).map(m => (
-              <button key={m.value} onClick={() => setMode(m.value)} disabled={phase !== 'idle'}
-                className={`p-3 rounded-lg border text-left transition-colors ${mode === m.value
-                  ? 'bg-blue-600/20 border-blue-500'
-                  : 'bg-slate-800 border-slate-600 hover:border-slate-500'}`}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <m.icon className="w-3.5 h-3.5 text-blue-400" />
-                  <span className="text-sm font-medium text-slate-200">{m.label}</span>
-                </div>
-                <p className="text-[10px] text-slate-400">{m.desc}</p>
-                <p className="text-[10px] text-slate-500 mt-0.5">{m.time}</p>
-              </button>
             ))}
           </div>
         </div>
@@ -1660,10 +1612,6 @@ export default function FPAnalyzer() {
             {([
               { scope: 'waf_signatures' as AnalysisScope, label: 'WAF Signatures' },
               { scope: 'waf_violations' as AnalysisScope, label: 'WAF Violations' },
-              { scope: 'threat_mesh' as AnalysisScope, label: 'Threat Mesh' },
-              { scope: 'service_policy' as AnalysisScope, label: 'Service Policy' },
-              { scope: 'bot_defense' as AnalysisScope, label: 'Bot Defense' },
-              { scope: 'api_security' as AnalysisScope, label: 'API Security' },
             ]).map(s => (
               <button key={s.scope} onClick={() => toggleScope(s.scope)} disabled={phase !== 'idle'}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${scopes.includes(s.scope)
@@ -1745,9 +1693,9 @@ export default function FPAnalyzer() {
               {progress.adaptiveState && (
                 <div className="mt-3 flex items-center gap-2 text-xs">
                   <span className="text-slate-400">Concurrency:</span>
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                    progress.adaptiveState === 'GREEN' ? 'bg-emerald-500/20 text-emerald-400'
-                    : progress.adaptiveState === 'YELLOW' ? 'bg-yellow-500/20 text-yellow-400'
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium uppercase ${
+                    progress.adaptiveState.toLowerCase() === 'green' ? 'bg-emerald-500/20 text-emerald-400'
+                    : progress.adaptiveState.toLowerCase() === 'yellow' ? 'bg-yellow-500/20 text-yellow-400'
                     : 'bg-red-500/20 text-red-400'
                   }`}>{progress.adaptiveState}</span>
                   <span className="text-slate-500">{progress.adaptiveConcurrency} parallel workers</span>
@@ -1775,9 +1723,9 @@ export default function FPAnalyzer() {
                 <span className="text-slate-400">{summary.totalEvents.toLocaleString()} events analyzed</span>
                 {scopes.includes('waf_signatures') && summary.signatures.length > 0 && (<>
                   <span className="text-slate-600">|</span>
-                  <span className="text-red-400">{summary.signatures.filter(s => s.quickVerdict === 'likely_fp').length} Likely FP</span>
-                  <span className="text-yellow-400">{summary.signatures.filter(s => s.quickVerdict === 'investigate').length} Investigate</span>
-                  <span className="text-emerald-400">{summary.signatures.filter(s => s.quickVerdict === 'likely_tp').length} Likely TP</span>
+                  <span className="text-red-400">{summary.signatures.filter(s => s.fpVerdict === 'highly_likely_fp' || s.fpVerdict === 'likely_fp').length} Likely FP</span>
+                  <span className="text-yellow-400">{summary.signatures.filter(s => s.fpVerdict === 'ambiguous').length} Ambiguous</span>
+                  <span className="text-emerald-400">{summary.signatures.filter(s => s.fpVerdict === 'likely_tp' || s.fpVerdict === 'confirmed_tp').length} Likely TP</span>
                 </>)}
                 {scopes.includes('waf_violations') && summary.violations.length > 0 && (
                   <span className="text-slate-400">{summary.violations.length} violations</span>
@@ -1807,46 +1755,94 @@ export default function FPAnalyzer() {
             </div>
           </div>
 
-          {/* Enrichment progress banner */}
-          {progress && progress.hybridEnrichPhase && progress.hybridEnrichPhase !== 'complete' && (
-            <div className="bg-blue-900/30 border border-blue-700/50 rounded-xl p-3 mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                <span className="text-xs text-blue-300">
-                  {progress.hybridEnrichPhase === 'fetching_access_logs' && `Fetching access logs (${(progress.accessLogsCollected || 0).toLocaleString()} collected)...`}
-                  {progress.hybridEnrichPhase === 'enriching_signatures' && `Enriching signatures (${progress.sigEnrichCompleted || 0}/${progress.sigEnrichTotal || 0})...`}
-                  {progress.hybridEnrichPhase === 'enriching_violations' && `Enriching violations (${progress.violEnrichCompleted || 0}/${progress.violEnrichTotal || 0})...`}
-                  {progress.hybridEnrichPhase === 'enriching_tm' && `Enriching threat mesh IPs (${progress.tmEnrichCompleted || 0}/${progress.tmEnrichTotal || 0})...`}
-                </span>
-                <span className="text-[10px] text-slate-500 ml-auto">You can browse results while enrichment continues</span>
+          {/* Recommendations & Next Steps — the prescriptive action plan */}
+          {summary.recommendations && summary.recommendations.steps.length > 0 && (() => {
+            const rec = summary.recommendations;
+            const kindCfg: Record<string, { badge: string }> = {
+              exclude: { badge: 'bg-amber-600/25 text-amber-300' },
+              investigate: { badge: 'bg-blue-600/25 text-blue-300' },
+              enable_ai: { badge: 'bg-violet-600/25 text-violet-300' },
+              block_bots: { badge: 'bg-rose-600/25 text-rose-300' },
+              block: { badge: 'bg-emerald-600/25 text-emerald-300' },
+              done: { badge: 'bg-emerald-600/25 text-emerald-300' },
+            };
+            return (
+            <div className="bg-slate-800/60 border border-blue-700/40 rounded-xl p-4 mb-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Target className="w-4 h-4 text-blue-400" />
+                <h3 className="text-sm font-semibold text-slate-100">Recommendations &amp; Next Steps</h3>
               </div>
-              {(() => {
-                let pct = 0;
-                if (progress.hybridEnrichPhase === 'fetching_access_logs') pct = 10;
-                else if (progress.hybridEnrichPhase === 'enriching_signatures') pct = 25 + ((progress.sigEnrichCompleted || 0) / Math.max(progress.sigEnrichTotal || 1, 1)) * 25;
-                else if (progress.hybridEnrichPhase === 'enriching_violations') pct = 50 + ((progress.violEnrichCompleted || 0) / Math.max(progress.violEnrichTotal || 1, 1)) * 20;
-                else if (progress.hybridEnrichPhase === 'enriching_tm') pct = 70 + ((progress.tmEnrichCompleted || 0) / Math.max(progress.tmEnrichTotal || 1, 1)) * 30;
-                return (
-                  <div className="w-full bg-slate-700 rounded-full h-1.5">
-                    <div className="h-1.5 rounded-full bg-blue-500 transition-all duration-500" style={{ width: `${pct}%` }} />
-                  </div>
-                );
-              })()}
+              <p className="text-xs text-slate-400 mb-3">Goal: tune out false positives, then move this load balancer from {rec.enforcementMode === 'blocking' ? 'its current Blocking config to a verified state' : 'Monitoring to Blocking'} with AI-powered WAF protection.</p>
+              <ol className="space-y-2">
+                {rec.steps.map(s => {
+                  const cfg = kindCfg[s.kind] || kindCfg.investigate;
+                  return (
+                    <li key={s.num} className="flex gap-2.5">
+                      <span className={`flex-shrink-0 w-6 h-6 rounded-full ${cfg.badge} text-xs font-bold flex items-center justify-center`}>{s.num}</span>
+                      <div>
+                        <div className="text-xs font-semibold text-slate-200">{s.title}</div>
+                        <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">{s.detail}</p>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+              {(rec.excludeList.length > 0 || rec.investigateList.length > 0) && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                  {rec.excludeList.length > 0 && (
+                    <div className="bg-amber-900/15 border border-amber-700/40 rounded-lg p-2.5">
+                      <div className="text-[11px] font-semibold text-amber-300 mb-1">Exclude these {rec.excludeList.length} false positive(s):</div>
+                      <ul className="text-[10px] text-slate-400 space-y-0.5 max-h-32 overflow-auto">
+                        {rec.excludeList.slice(0, 15).map((e, i) => <li key={i}><span className="font-mono text-slate-300">{e.id}</span> — {e.name.slice(0, 60)} <span className="text-amber-400">({e.verdict.replace(/_/g, ' ')})</span></li>)}
+                        {rec.excludeList.length > 15 && <li className="text-slate-500">+{rec.excludeList.length - 15} more (see Signatures table)</li>}
+                      </ul>
+                    </div>
+                  )}
+                  {rec.investigateList.length > 0 && (
+                    <div className="bg-blue-900/15 border border-blue-700/40 rounded-lg p-2.5">
+                      <div className="text-[11px] font-semibold text-blue-300 mb-1">Investigate &amp; confirm these {rec.investigateList.length} (do not auto-exclude):</div>
+                      <ul className="text-[10px] text-slate-400 space-y-0.5 max-h-32 overflow-auto">
+                        {rec.investigateList.slice(0, 15).map((e, i) => <li key={i}><span className="font-mono text-slate-300">{e.id}</span> — {e.name.slice(0, 70)}</li>)}
+                        {rec.investigateList.length > 15 && <li className="text-slate-500">+{rec.investigateList.length - 15} more (Verdict = Likely FP / Ambiguous in the table)</li>}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+              {rec.autoHandledList.length > 0 && (
+                <div className="mt-3 bg-emerald-900/15 border border-emerald-700/40 rounded-lg p-2.5 text-[11px] text-emerald-300">
+                  ✓ {rec.autoHandledList.length} finding{rec.autoHandledList.length > 1 ? 's are' : ' is'} already auto-suppressed by F5's AI false-positive detection — <span className="text-slate-400">no exclusion rule needed for {rec.autoHandledList.length > 1 ? 'these' : 'this'} (F5 already handles {rec.autoHandledList.length > 1 ? 'them' : 'it'}).</span>
+                </div>
+              )}
             </div>
-          )}
-          {/* TM-only enrichment (quick mode) */}
-          {progress && !progress.hybridEnrichPhase && progress.tmEnrichTotal != null && progress.tmEnrichTotal > 0 && progress.tmEnrichCompleted != null && progress.tmEnrichCompleted < progress.tmEnrichTotal && (
-            <div className="bg-blue-900/30 border border-blue-700/50 rounded-xl p-3 mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                <span className="text-xs text-blue-300">
-                  Enriching threat mesh IPs with access logs ({progress.tmEnrichCompleted}/{progress.tmEnrichTotal})...
+            );
+          })()}
+
+          {/* Context banner: enforcement mode, data completeness, sampling */}
+          {(summary.enforcementMode === 'monitoring' || summary.enforcementMode === 'blocking' || summary.dataPartial || progress?.dataPartial || (summary.avgSampleRate && summary.avgSampleRate > 1.5)) && (
+            <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
+              {summary.enforcementMode === 'monitoring' && (
+                <span className="px-2.5 py-1 rounded-lg bg-amber-900/30 border border-amber-700/50 text-amber-300" title="WAF is not blocking — exclusions are advisory and signatures are not currently enforced">
+                  ⓘ WAF in MONITORING mode — exclusions are advisory, not enforced
                 </span>
-              </div>
-              <div className="w-full bg-slate-700 rounded-full h-1.5">
-                <div className="h-1.5 rounded-full bg-blue-500 transition-all duration-500"
-                  style={{ width: `${(progress.tmEnrichCompleted / progress.tmEnrichTotal) * 100}%` }} />
-              </div>
+              )}
+              {summary.enforcementMode === 'blocking' && (
+                <span className="px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300" title="WAF is actively blocking — confirmed exclusions will take effect">
+                  🛡 WAF BLOCKING — exclusions will take effect
+                </span>
+              )}
+              {(summary.dataPartial || progress?.dataPartial) && (
+                <span className="px-2.5 py-1 rounded-lg bg-red-900/30 border border-red-700/50 text-red-300"
+                  title={progress?.securityEventsExpected ? `Collected ${progress.securityEventsCollected.toLocaleString()} of ~${progress.securityEventsExpected.toLocaleString()} events` : 'Some time chunks under-fetched'}>
+                  ⚠ Partial data — collection under-fetched; verdicts may be incomplete
+                </span>
+              )}
+              {summary.avgSampleRate && summary.avgSampleRate > 1.5 && (
+                <span className="px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-400"
+                  title="Access logs are sampled by F5 XC; request-volume denominators are de-sampled (×sample_rate) before scoring">
+                  Access logs sampled ~{summary.avgSampleRate.toFixed(0)}× — denominators de-sampled
+                </span>
+              )}
             </div>
           )}
 
@@ -1856,16 +1852,178 @@ export default function FPAnalyzer() {
             <div className="flex items-center gap-3">
               <button onClick={markAllHighFPAsConfirmed}
                 className="px-3 py-1.5 text-xs bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg border border-red-600/30 transition-colors"
-              >Mark all "Likely FP (HIGH)" as Confirmed FP</button>
+              >Mark all "Highly Likely FP" as Confirmed FP</button>
               <button onClick={generateExclusionPolicy} disabled={confirmedFPCount === 0 || generatingPolicy}
                 className="px-3 py-1.5 text-xs bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg border border-blue-600/30 transition-colors disabled:opacity-40"
               >{copied ? 'Copied!' : `Generate Exclusion Policy (${confirmedFPCount} FPs)`}</button>
+              <button onClick={stageExclusionToTenant} disabled={confirmedFPCount === 0 || stagingPolicy}
+                className="px-3 py-1.5 text-xs bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 rounded-lg border border-amber-600/30 transition-colors disabled:opacity-40"
+                title="Create the exclusion policy in the tenant as an unattached config object (no enforcement until you attach it in the XC console)"
+              >{stagingPolicy ? 'Creating…' : 'Stage to Tenant'}</button>
             </div>
             <div className="text-xs text-slate-500">
               {confirmedFPCount} FP, {confirmedTPCount} TP, {unreviewed} unreviewed
             </div>
           </div>
           )}
+
+          {/* Traditional vs AI-Powered WAF comparison */}
+          {summary.wafComparison && summary.wafComparison.totalEvents > 0 && (() => {
+            const wc = summary.wafComparison;
+            const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
+            const share = (n: number) => wc.totalEvents > 0 ? pct(n / wc.totalEvents) : '0%';
+            const tuning = [...wc.bySignature].filter(s => s.engineActiveAiBenign > 0).sort((a, b) => b.origin200Pct - a.origin200Pct);
+            const cards = [
+              { n: wc.matrix.bothAttack, title: 'Real attack — both agree', sub: 'Signature flagged + AI rates high/medium risk', cls: 'bg-slate-800 border-slate-600', num: 'text-slate-200', icon: '✓' },
+              { n: wc.matrix.engineActiveAiBenign, title: 'Likely false positive', sub: 'Signature still Enabled, but AI rates benign — AI-based blocking would skip these', cls: 'bg-amber-900/20 border-amber-700/50', num: 'text-amber-300', icon: '⚠' },
+              { n: wc.matrix.aiSuppressedRiskAttack, title: 'AI flags, signature suppressed', sub: 'AI sees risk on a signature the auto-tuning already suppressed — review', cls: 'bg-red-900/20 border-red-700/50', num: 'text-red-300', icon: '⚠' },
+              { n: wc.matrix.bothBenign, title: 'False positive — auto-tuned out', sub: 'AutoSuppressed by F5 tuning + AI agrees benign (working as intended)', cls: 'bg-emerald-900/20 border-emerald-700/50', num: 'text-emerald-300', icon: '✓' },
+            ];
+            return (
+            <Section title="Traditional vs AI-Powered WAF" icon={Target} expanded={expandedSections.wafComparison} onToggle={() => toggleSection('wafComparison')} badge={pct(wc.agreementPct)}>
+              {/* Plain-language headline (analysis — the action plan is in Recommendations above) */}
+              <p className="text-sm text-slate-200 mb-3">{wc.headline}</p>
+
+              {/* Enforcement note (e.g. monitoring → attacks not blocked) */}
+              {wc.enforcementNote && (
+                <div className="bg-amber-900/20 border border-amber-700/40 rounded-lg p-2.5 mb-3 text-xs text-amber-300">⚠ {wc.enforcementNote}</div>
+              )}
+
+              {/* How the engines classified the flagged requests (matrix → 4 plain cards) */}
+              <div className="text-xs text-slate-400 mb-1.5">How both engines classified the {wc.totalEvents.toLocaleString()} flagged requests:</div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
+                {cards.map((c, i) => (
+                  <div key={i} className={`${c.cls} border rounded-lg p-2.5`}>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xs font-medium text-slate-200">{c.icon} {c.title}</span>
+                      <span className={`text-base font-bold ${c.num}`}>{c.n.toLocaleString()} <span className="text-[10px] text-slate-500">({share(c.n)})</span></span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-0.5">{c.sub}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Compact stats line */}
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400 mb-3">
+                <span>AI verdict coverage: <span className="text-slate-300">{pct(wc.aiDataCoveragePct)}</span></span>
+                <span>FP-block reduction if AI enabled: <span className="text-amber-300">{pct(wc.fpReductionOpportunityPct)}</span></span>
+                <span>AI-benign served 200 (FP corroboration): <span className="text-emerald-300">{pct(wc.aiBenignOrigin200Pct)}</span></span>
+                <span>Already auto-suppressed: <span className="text-slate-300">{wc.alreadySuppressedByAi.toLocaleString()}</span></span>
+              </div>
+
+              {/* Tuning candidates */}
+              {tuning.length > 0 && (<>
+                <div className="text-xs text-slate-400 mb-1">Tuning candidates — Enabled signatures the AI rates benign <span className="text-slate-500">(Origin 200% = how often the app actually served the request; higher = stronger false-positive evidence)</span>:</div>
+                <table className="w-full text-xs">
+                  <thead><tr className="text-slate-400 border-b border-slate-700">
+                    <th className="text-left py-1 pr-2">Sig ID</th><th className="text-left py-1 pr-2">Name</th>
+                    <th className="text-right py-1 pr-2">Events</th><th className="text-right py-1 pr-2">AI Benign</th>
+                    <th className="text-right py-1 pr-2">Origin 200%</th><th className="text-right py-1">FP evidence</th>
+                  </tr></thead>
+                  <tbody>
+                    {tuning.slice(0, 10).map(s => (
+                      <tr key={s.sigId} className="border-b border-slate-700/50">
+                        <td className="py-1 pr-2 font-mono text-slate-300">{s.sigId}</td>
+                        <td className="py-1 pr-2 text-slate-300 truncate max-w-xs">{s.name}</td>
+                        <td className="py-1 pr-2 text-right text-slate-300">{s.events}</td>
+                        <td className="py-1 pr-2 text-right text-amber-300">{s.aiBenign}</td>
+                        <td className="py-1 pr-2 text-right text-emerald-300">{pct(s.origin200Pct)}</td>
+                        <td className={`py-1 text-right ${s.origin200Pct >= 0.5 ? 'text-emerald-400' : 'text-slate-500'}`}>{s.origin200Pct >= 0.5 ? 'strong' : 'weak'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>)}
+            </Section>
+            );
+          })()}
+
+          {/* Bot Classification — is it safe to block the Malicious bots? */}
+          {summary.botAnalysis && (() => {
+            const ba = summary.botAnalysis;
+            const cc = ba.classificationCounts;
+            const counts = [
+              { label: 'Malicious', n: cc.malicious, cls: 'text-red-300' },
+              { label: 'Suspicious', n: cc.suspicious, cls: 'text-amber-300' },
+              { label: 'Benign / Good', n: cc.benign, cls: 'text-emerald-300' },
+              { label: 'Human', n: cc.human, cls: 'text-slate-300' },
+              { label: 'Unknown', n: cc.unknown, cls: 'text-slate-500' },
+            ];
+            const hasRisk = ba.fpRiskFlags.length > 0;
+            const recCls = ba.maliciousEvents > 0 && !hasRisk ? 'bg-emerald-900/20 border-emerald-700/40 text-emerald-200'
+              : hasRisk ? 'bg-amber-900/20 border-amber-700/40 text-amber-200'
+              : 'bg-slate-800 border-slate-600 text-slate-300';
+            const flagLabels = new Set(ba.fpRiskFlags.map(f => f.label));
+            return (
+            <Section title="Bot Classification" icon={Bot} expanded={expandedSections.botAnalysis} onToggle={() => toggleSection('botAnalysis')} badge={ba.maliciousIps}>
+              <div className={`border rounded-lg p-2.5 mb-3 text-sm ${recCls}`}>{ba.recommendation}</div>
+              <div className="text-xs text-slate-400 mb-1.5">F5 Bot Defense classification across WAF events <span className="text-slate-500">(only Malicious is blocked; Suspicious and Good/Benign are allowed/ignored)</span>:</div>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {counts.map((c, i) => (
+                  <div key={i} className="bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-1.5">
+                    <span className="text-xs text-slate-400">{c.label}</span>{' '}
+                    <span className={`text-sm font-bold ${c.cls}`}>{c.n.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+              {ba.maliciousEvents > 0 ? (<>
+                <div className="text-xs text-slate-400 mb-2">{ba.maliciousEvents.toLocaleString()} malicious events from {ba.maliciousIps.toLocaleString()}{ba.ipsCapped ? '+' : ''} distinct client(s){ba.ipsCapped ? ' (top 500 shown)' : ''}. <span className="text-slate-500">Computed from server-side aggregation — no raw malicious-bot logs downloaded.</span></div>
+
+                {hasRisk && (
+                  <div className="bg-amber-900/15 border border-amber-700/40 rounded-lg p-2.5 mb-3">
+                    <div className="text-[11px] font-semibold text-amber-300 mb-1">⚠ Potential false positives in the Malicious set — verify before blocking:</div>
+                    <ul className="text-[11px] text-slate-300 space-y-0.5">
+                      {ba.fpRiskFlags.map((f, i) => (
+                        <li key={i} className="truncate" title={f.label}>
+                          <span className={`text-[10px] px-1 py-0.5 rounded mr-1 ${f.kind === 'known_good_bot' ? 'bg-red-900/40 text-red-300' : 'bg-amber-900/40 text-amber-300'}`}>{f.kind === 'known_good_bot' ? 'known-good bot' : 'real browser'}</span>
+                          <span className="font-mono text-slate-300">{f.label}</span> <span className="text-slate-500">({f.count.toLocaleString()} events)</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Top malicious source IPs:</div>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">Source IP</th><th className="text-right py-1">Events</th></tr></thead>
+                      <tbody>
+                        {ba.topMaliciousIps.map((b, i) => (
+                          <tr key={i} className="border-b border-slate-700/50"><td className="py-1 pr-2 font-mono text-slate-300">{b.key}</td><td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td></tr>
+                        ))}
+                        {ba.topMaliciousIps.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Top user-agents in the Malicious set <span className="text-slate-500">(⚠ = possible FP)</span>:</div>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">User-Agent</th><th className="text-right py-1">Events</th></tr></thead>
+                      <tbody>
+                        {ba.topUserAgents.map((b, i) => {
+                          const risky = flagLabels.has(b.key);
+                          return (
+                          <tr key={i} className="border-b border-slate-700/50">
+                            <td className={`py-1 pr-2 max-w-[260px] truncate ${risky ? 'text-amber-300' : 'text-slate-300'}`} title={b.key}>{risky ? '⚠ ' : ''}{b.key}</td>
+                            <td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td>
+                          </tr>
+                          );
+                        })}
+                        {ba.topUserAgents.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                {ba.topCountries.length > 0 && (
+                  <div className="text-[11px] text-slate-400 mt-2">Top countries: {ba.topCountries.slice(0, 8).map(c => `${c.key} (${c.count.toLocaleString()})`).join(', ')}</div>
+                )}
+              </>) : (
+                <div className="text-xs text-slate-500">No Malicious-classified bots in this window — nothing to block.</div>
+              )}
+            </Section>
+            );
+          })()}
 
           {/* WAF Signatures section — only if scope selected */}
           {scopes.includes('waf_signatures') && (
@@ -1895,6 +2053,7 @@ export default function FPAnalyzer() {
                       <th className="text-right py-2 pr-2 w-16">Users</th>
                       <th className="text-right py-2 pr-2 w-16">Paths</th>
                       <th className="text-center py-2 pr-2 w-16">Accuracy</th>
+                      <th className="text-center py-2 pr-2 w-20" title="F5 AI-WAF per-request risk verdict (Likelihood × Impact)">AI Risk</th>
                       <th className="text-right py-2 pr-2 w-16">FP Score</th>
                       <th className="text-center py-2 w-32">Verdict</th>
                       <th className="text-center py-2 w-20">Status</th>
@@ -1921,6 +2080,17 @@ export default function FPAnalyzer() {
                           <span className={`text-[10px] ${sig.accuracy === 'high_accuracy' ? 'text-emerald-400' : sig.accuracy === 'low_accuracy' ? 'text-red-400' : 'text-yellow-400'}`}>
                             {sig.accuracy === 'high_accuracy' ? 'High' : sig.accuracy === 'low_accuracy' ? 'Low' : 'Med'}
                           </span>
+                        </td>
+                        <td className="py-2 pr-2 text-center whitespace-nowrap">
+                          {sig.aiRisk && sig.aiRisk !== 'unknown' && (
+                            <span className={`text-[10px] font-medium ${sig.aiRisk === 'high' ? 'text-red-400' : sig.aiRisk === 'low' ? 'text-emerald-400' : 'text-yellow-400'}`}
+                              title="F5 AI-WAF risk verdict: High = likely real attack, Low = likely benign/FP">
+                              {sig.aiRisk === 'high' ? 'High' : sig.aiRisk === 'low' ? 'Low' : 'Med'}
+                            </span>
+                          )}
+                          {sig.staged && <span className="ml-1 text-[8px] px-1 rounded bg-purple-900/40 text-purple-300 border border-purple-700/40" title="Signature in Staging — monitor-only, not blocking">STG</span>}
+                          {sig.autoSuppressed && <span className="ml-1 text-[8px] px-1 rounded bg-blue-900/40 text-blue-300 border border-blue-700/40" title="AutoSuppressed by F5 ML — already treated as FP">AS</span>}
+                          {(!sig.aiRisk || sig.aiRisk === 'unknown') && !sig.staged && !sig.autoSuppressed && <span className="text-[10px] text-slate-600">—</span>}
                         </td>
                         <td className={`py-2 pr-2 text-right font-medium ${fpVCfg.text}`}>
                           {displayScore}%{isEnriched && <span className="text-[8px] text-blue-400 ml-0.5" title="Enriched with access logs">*</span>}
@@ -2101,8 +2271,6 @@ export default function FPAnalyzer() {
           {sigDetail && (
             <SignatureDetailView
               unit={sigDetail}
-              onEnrich={enrichSignature}
-              enriching={enriching}
               onBack={() => setPhase('summary')}
               onPrev={goToPrev}
               onNext={goToNext}

@@ -116,6 +116,27 @@ export class NodeApiCaller {
     });
   }
 
+  /**
+   * Server-side aggregation over security events (terms buckets, no raw rows).
+   * Body mirrors F5 XC's aggregation schema: { aggs: { key: { field, topk } } }
+   * → response { aggs: { key: { buckets: [{ key, count }] } } }.
+   */
+  async fetchSecurityEventsAggregation(
+    namespace: string,
+    query: string,
+    startTime: string,
+    endTime: string,
+    aggs: Record<string, { field: string; topk: number }>,
+  ): Promise<{ aggs?: Record<string, unknown> }> {
+    return this.fetch('POST', `/api/data/namespaces/${namespace}/app_security/events/aggregation`, {
+      namespace,
+      query,
+      start_time: startTime,
+      end_time: endTime,
+      aggs,
+    });
+  }
+
   // ───── Access Logs ─────
 
   async fetchAccessLogsPage(

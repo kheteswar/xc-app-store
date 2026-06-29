@@ -1,26 +1,31 @@
 export * from './types';
 export { parseContext } from './context-parser';
-export { buildSecurityEventIndexes } from './security-event-indexer';
-export { aggregateBatch, finalizeAggregation, UserCounter } from './streaming-aggregator';
-export { computeAllSignals, applyScenario2Override, computeQuickModeSignals, getWeightsForMode } from './fp-scorer';
-export type { QuickModeSignalsInput } from './fp-scorer';
-export { analyzeSignatures } from './signature-analyzer';
 export {
-  scoreUserBreadth, scoreRequestBreadth, scorePathBreadth,
-  scoreContext, scoreClientProfile, scoreTemporalPattern, scoreSignatureAccuracy,
-  scoreUserBreadthQuick, scoreRequestBreadthQuick, scoreSignatureAccuracyEnhanced, scoreClientProfileQuick,
+  scorePathBreadth, scoreContext, scoreSignatureAccuracy,
   computeQuickVerdict, getScoreConfidence,
   mapToRecord, mergeNormalTimestamps, mergeNormalCountries,
 } from './signal-calculator';
+// Redesigned single-mode scoring (2026)
+export {
+  computeFpSignals, scoreToVerdict, FP_WEIGHTS,
+  scoreClientBreadth, scoreMatchingEvidence, scoreOriginResponse, scoreClientBehavior,
+  scoreViolationSeverity, isAlwaysTpViolation, EXPLOIT_PATH_RE,
+} from './fp-signals-v2';
+export type { FpSignalsInput, OriginResponseResult } from './fp-signals-v2';
+export { computeWafComparison } from './waf-comparison';
+export type { WafComparisonResult, WafSignatureDivergence, WafRecommendation } from './waf-comparison';
+export { buildFpRecommendations } from './recommendations';
+export { computeBotAnalysisFromAggregates, classifyBot } from './bot-analysis';
+export type { BotClass, BotAggregateInput } from './bot-analysis';
 export {
   generateSignatureExclusion, generateViolationExclusion,
   groupExclusionRules, pathToRegex, generateExclusionsForSignatures,
   generatePerPathExclusions, generateViolationPerPathExclusions,
   buildWafExclusionPolicy, cleanPolicyForExport,
+  generateAttackTypeExclusion, buildSignatureExclusionsWithRollup,
 } from './exclusion-generator';
-export { analyzeViolations } from './violation-analyzer';
-export { analyzeThreatMesh } from './threat-mesh-analyzer';
-export { analyzeServicePolicies } from './service-policy-analyzer';
+export type { SigExclusionIntent } from './exclusion-generator';
+export * from './ai-signals';
 export { exportAnalysisCSV, exportExclusionJSON } from './report-generator';
 export { analysisLogger, AnalysisLogger, anonIP, anonUser, anonUA, anonDomain, sanitizePath } from './analysis-logger';
 export type { LogEntry, LogLevel } from './analysis-logger';

@@ -1,4 +1,6 @@
 import type { AccessLogEntry, SecurityEventEntry } from '../rate-limit-advisor/types';
+import type { AiRiskCounts } from './ai-signals';
+import type { WafComparisonResult } from './waf-comparison';
 
 // Re-export for convenience
 export type { AccessLogEntry, SecurityEventEntry };
@@ -86,6 +88,47 @@ export interface SignalResult {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// REDESIGN (2026): single-mode signals + per-IP behavioral profile
+// ═══════════════════════════════════════════════════════════════
+
+/** The 7 redesigned FP signals (see fp-signals-v2.ts). Higher = more FP. */
+export interface FpSignals {
+  clientBreadth: SignalScore;
+  pathBreadth: SignalScore;
+  context: SignalScore;
+  matchingEvidence: SignalScore;
+  originResponse: SignalScore;
+  clientBehavior: SignalScore;
+  detectionConfidence: SignalScore;
+  compositeScore: number;
+  verdict: FPVerdict;
+  /** 2xx response on a malicious-looking payload — surfaced as a likely successful exploit. */
+  possibleSuccessfulExploit?: boolean;
+  override?: string;
+  overrideReason?: string;
+}
+
+/** Behavioral profile of a single flagged client IP, from ITS OWN full access logs. */
+export interface IPBehaviorProfile {
+  ip: string;
+  enriched: boolean;
+  totalRequests: number;          // de-sampled
+  rspCodes: Record<string, number>;
+  successRatio: number;           // 2xx / total
+  notFoundRatio: number;          // 404 / total
+  clientErrorRatio: number;       // other 4xx / total
+  serverErrorRatio: number;       // 5xx / total
+  uniquePaths: number;
+  exploitPathHits: number;
+  reqPerHour: number;
+  topUserAgent: string;
+  country: string;
+  asOrg: string;
+  wafEventCount: number;          // this IP's requests that were WAF events
+  wafEventRatio: number;          // wafEventCount / totalRequests
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PER-PATH FP/TP ANALYSIS
 // ═══════════════════════════════════════════════════════════════
 
@@ -155,9 +198,16 @@ export interface SignatureAnalysisUnit {
   aiConfirmed: boolean;
   sigState: string;
 
-  signals: SignalResult;
+  signals: FpSignals;
+  /** Per-IP behavioral profiles for the flagged clients (redesign). */
+  ipProfiles?: IPBehaviorProfile[];
 
   autoSuppressed?: boolean;
+  staged?: boolean;
+  /** AI-WAF: req_risk distribution across this signature's events. */
+  aiRiskCounts?: AiRiskCounts;
+  /** AI-WAF: dominant recommended_action (allow/report/block). */
+  recommendedAction?: string;
   enriched?: boolean;
   suggestedExclusion?: WafExclusionRule;
 }
@@ -186,9 +236,11 @@ export interface ViolationAnalysisUnit {
   userAgents: Record<string, number>;
   countries: Record<string, number>;
   methods: Record<string, number>;
+  botClassifications?: Record<string, number>;
   sampleMatchingInfos: string[];
   timestamps: string[];
-  signals: SignalResult;
+  signals: FpSignals;
+  ipProfiles?: IPBehaviorProfile[];
   suggestedExclusion?: WafExclusionRule;
 }
 
@@ -360,6 +412,12 @@ export interface SignatureSummary {
   uniqueIPs: number;
   topPaths: Array<{ path: string; count: number }>;
   autoSuppressed: boolean;
+  /** AI-WAF: dominant req_risk level across this signature's events (high/medium/low). */
+  aiRisk?: 'high' | 'medium' | 'low' | 'unknown';
+  /** AI-WAF: dominant recommended_action (allow/report/block). */
+  recommendedAction?: string;
+  /** Signature is in Staging (monitor-only, not actually blocking). */
+  staged?: boolean;
   actions: { block: number; report: number };
   quickVerdict: QuickVerdict;
   quickConfidence: ConfidenceLevel;
@@ -380,6 +438,8 @@ export interface ViolationSummary {
   uniqueUsers: number;
   uniquePaths: number;
   topPaths: Array<{ path: string; count: number }>;
+  /** AI-WAF: dominant req_risk level across this violation's events. */
+  aiRisk?: 'high' | 'medium' | 'low' | 'unknown';
   quickVerdict: QuickVerdict;
   quickConfidence: ConfidenceLevel;
   fpScore: number;
@@ -425,6 +485,88 @@ export interface SummaryResult {
   policyRules: PolicyRuleSummary[];
   totalEvents: number;
   period: { start: string; end: string };
+  /** LB WAF enforcement: BLOCKING means exclusions take effect; MONITORING is advisory. */
+  enforcementMode?: 'blocking' | 'monitoring' | 'unknown';
+  /** Average access-log sample_rate observed (hybrid). 1 = unsampled. */
+  avgSampleRate?: number;
+  /** True if event collection under-fetched vs server total_hits. */
+  dataPartial?: boolean;
+  /** Traditional signature engine vs AI-powered (req_risk) comparison. */
+  wafComparison?: WafComparisonResult;
+  /** Prescriptive action plan to move the customer to Blocking mode safely. */
+  recommendations?: FpRecommendations;
+  /** Bot classification (bot_info) analysis — is it safe to block Malicious bots? */
+  botAnalysis?: BotAnalysisResult;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BOT CLASSIFICATION ANALYSIS
+// ═══════════════════════════════════════════════════════════════
+
+/** A single terms-aggregation bucket (server-side count, no raw rows). */
+export interface BotAggBucket { key: string; count: number; }
+
+/**
+ * A false-positive risk indicator found *inside* the Malicious-classified set:
+ * a known-good bot name (Googlebot…) or a real-browser user-agent that — being
+ * uncorrelated by aggregation — warrants a manual look before bot blocking.
+ */
+export interface BotFpRiskFlag {
+  kind: 'known_good_bot' | 'real_browser';
+  label: string;   // the bot name or user-agent string
+  count: number;   // malicious events carrying it
+}
+
+/**
+ * Bot classification, computed from SERVER-SIDE AGGREGATIONS (no raw malicious-bot
+ * rows are downloaded). Answers: is it safe to block the Malicious bots, or would
+ * that hit a known-good crawler / real user?
+ */
+export interface BotAnalysisResult {
+  /** Event counts by bot classification (from a bot_class distribution aggregation over all WAF events). */
+  classificationCounts: { malicious: number; suspicious: number; benign: number; human: number; unknown: number };
+  maliciousEvents: number;          // total Malicious-classified WAF events
+  maliciousIps: number;             // distinct Malicious src_ip (bucket count; capped at topk)
+  ipsCapped: boolean;               // true if distinct IPs hit the topk cap (undercount)
+  topMaliciousIps: BotAggBucket[];  // src_ip → events (for the table)
+  topBotNames: BotAggBucket[];      // bot_name → events
+  topUserAgents: BotAggBucket[];    // user_agent → events
+  topCountries: BotAggBucket[];     // country → events
+  /** Known-good bots / real-browser UAs detected among the Malicious set → review before blocking. */
+  fpRiskFlags: BotFpRiskFlag[];
+  recommendation: string;
+  /** Marker: this result came from aggregation (no per-request enrichment). */
+  aggregated: true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RECOMMENDATIONS / NEXT STEPS
+// ═══════════════════════════════════════════════════════════════
+
+export type RecoKind = 'exclude' | 'investigate' | 'enable_ai' | 'block' | 'block_bots' | 'done';
+
+export interface RecoStep {
+  num: number;
+  kind: RecoKind;
+  title: string;
+  detail: string;
+}
+
+export interface FpRecommendations {
+  enforcementMode: 'blocking' | 'monitoring' | 'unknown';
+  fpCount: number;
+  tpCount: number;
+  ambiguousCount: number;
+  /** Recommended AI-powered WAF blocking threshold. */
+  aiBlockingThreshold: 'high' | 'high_medium';
+  aiThresholdReason: string;
+  steps: RecoStep[];
+  /** High-confidence false positives NOT already auto-suppressed → candidates for a manual exclusion (confirm first). */
+  excludeList: Array<{ kind: 'signature' | 'violation'; id: string; name: string; verdict: FPVerdict }>;
+  /** Likely-FP / ambiguous findings → manual investigation & confirmation, NOT auto-exclusion. */
+  investigateList: Array<{ kind: string; id: string; name: string; reason: string }>;
+  /** Already auto-suppressed by F5's AI FP detection → no exclusion rule needed. */
+  autoHandledList: Array<{ kind: string; id: string; name: string }>;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -436,6 +578,10 @@ export type ProgressiveJobStatus = 'collecting' | 'summary_ready' | 'enriching' 
 export interface ProgressiveJobProgress {
   status: ProgressiveJobStatus;
   securityEventsCollected: number;
+  /** Server-reported total_hits summed across chunks (expected event count). */
+  securityEventsExpected?: number;
+  /** True if any chunk under-fetched (scroll broke / error) vs total_hits. */
+  dataPartial?: boolean;
   signaturesFound: number;
   violationsFound: number;
   totalChunks: number;
@@ -446,16 +592,9 @@ export interface ProgressiveJobProgress {
   adaptiveState?: string;
   adaptiveConcurrency?: number;
   error?: string;
-  /** Threat mesh enrichment progress */
-  tmEnrichTotal?: number;
-  tmEnrichCompleted?: number;
-  /** Hybrid mode enrichment progress */
-  hybridEnrichPhase?: 'fetching_access_logs' | 'enriching_signatures' | 'enriching_violations' | 'enriching_tm' | 'complete';
-  accessLogsCollected?: number;
-  sigEnrichTotal?: number;
-  sigEnrichCompleted?: number;
-  violEnrichTotal?: number;
-  violEnrichCompleted?: number;
+  /** Per-IP behavioral enrichment progress (redesign). */
+  ipEnrichTotal?: number;
+  ipEnrichCompleted?: number;
 }
 
 export interface EnrichmentResult {

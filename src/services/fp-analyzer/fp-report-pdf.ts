@@ -30,7 +30,7 @@ export interface FPReportOptions {
   scopes: AnalysisScope[];
   namespace: string;
   lbName: string;
-  mode: AnalysisMode;
+  mode?: AnalysisMode;
   threatMeshDetails?: ThreatMeshAnalysisUnit[];
   signatureDetails?: SignatureAnalysisUnit[];
   violationDetails?: ViolationAnalysisUnit[];
@@ -136,7 +136,7 @@ function addHeader(doc: jsPDF, opts: FPReportOptions): number {
   y += 5;
   doc.text(`Namespace: ${opts.namespace}`, PAGE_MARGIN, y);
   y += 5;
-  doc.text(`Mode: ${opts.mode}  |  Scopes: ${opts.scopes.join(', ')}`, PAGE_MARGIN, y);
+  doc.text(`Scopes: ${opts.scopes.join(', ')}`, PAGE_MARGIN, y);
   y += 5;
 
   const start = new Date(opts.summary.period.start).toLocaleString();
@@ -190,6 +190,155 @@ function addExecutiveSummary(doc: jsPDF, summary: SummaryResult, scopes: Analysi
     y += 5;
   }
 
+  return y + 5;
+}
+
+function addRecommendations(doc: jsPDF, summary: SummaryResult, y: number): number {
+  const rec = summary.recommendations;
+  if (!rec || rec.steps.length === 0) return y;
+  y = sectionTitle(doc, 'Recommendations & Next Steps', y);
+
+  doc.setFontSize(8); doc.setFont('helvetica', 'normal'); doc.setTextColor(...GRAY);
+  const intro = `Goal: tune out false positives, then move this load balancer ${rec.enforcementMode === 'blocking' ? 'to a verified Blocking state' : 'from Monitoring to Blocking'} with AI-powered WAF protection.`;
+  const introLines = doc.splitTextToSize(intro, CONTENT_WIDTH) as string[];
+  doc.text(introLines, PAGE_MARGIN, y); y += introLines.length * 4 + 3;
+
+  for (const s of rec.steps) {
+    y = ensureSpace(doc, y, 16);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.setTextColor(...DARK);
+    doc.text(`${s.num}. ${s.title}`, PAGE_MARGIN, y); y += 4;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...GRAY);
+    const dl = doc.splitTextToSize(s.detail, CONTENT_WIDTH - 5) as string[];
+    doc.text(dl, PAGE_MARGIN + 5, y); y += dl.length * 4 + 2;
+  }
+
+  if (rec.excludeList.length > 0) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(...GRAY);
+    y = ensureSpace(doc, y + 1, 14); doc.text(`False positives to exclude (${rec.excludeList.length}):`, PAGE_MARGIN, y); y += 2;
+    y = autoTable(doc, {
+      startY: y, head: [['Type', 'ID', 'Name', 'Verdict']],
+      body: rec.excludeList.slice(0, 40).map(e => [e.kind, e.id, truncate(e.name, 55), verdictLabel(e.verdict)]),
+      theme: 'striped', headStyles: { fillColor: [...BLUE], textColor: 255, fontSize: 7 }, styles: { fontSize: 7, cellPadding: 1.5 }, margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+    });
+  }
+  if (rec.investigateList.length > 0) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(...GRAY);
+    y = ensureSpace(doc, y + 1, 14); doc.text(`Investigate & manually confirm — do NOT auto-exclude (${rec.investigateList.length}):`, PAGE_MARGIN, y); y += 2;
+    y = autoTable(doc, {
+      startY: y, head: [['Type', 'ID', 'Name / Reason']],
+      body: rec.investigateList.slice(0, 40).map(e => [e.kind, e.id, truncate(`${e.name} — ${e.reason}`, 90)]),
+      theme: 'striped', headStyles: { fillColor: [...BLUE], textColor: 255, fontSize: 7 }, styles: { fontSize: 7, cellPadding: 1.5 }, margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+    });
+  }
+  if (rec.autoHandledList.length > 0) {
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...GRAY);
+    y = ensureSpace(doc, y + 1, 10);
+    const note = doc.splitTextToSize(`Note: ${rec.autoHandledList.length} finding(s) are already auto-suppressed by F5's AI false-positive detection — no exclusion rule is needed for them.`, CONTENT_WIDTH) as string[];
+    doc.text(note, PAGE_MARGIN, y); y += note.length * 4 + 2;
+  }
+  return y + 5;
+}
+
+function addWafComparison(doc: jsPDF, summary: SummaryResult, y: number): number {
+  const wc = summary.wafComparison;
+  if (!wc || wc.totalEvents === 0) return y;
+  y = sectionTitle(doc, 'Traditional vs AI-Powered WAF', y);
+
+  const pct = (x: number) => `${(x * 100).toFixed(0)}%`;
+  // Plain-language headline (analysis — the action plan is in Recommendations above)
+  doc.setFontSize(9); doc.setFont('helvetica', 'normal'); doc.setTextColor(...DARK);
+  const headLines = doc.splitTextToSize(wc.headline, CONTENT_WIDTH) as string[];
+  doc.text(headLines, PAGE_MARGIN, y); y += headLines.length * 4.5 + 3;
+  doc.setFontSize(8); doc.setTextColor(...GRAY);
+  if (wc.enforcementNote) {
+    const noteLines = doc.splitTextToSize(`! ${wc.enforcementNote}`, CONTENT_WIDTH) as string[];
+    doc.text(noteLines, PAGE_MARGIN, y); y += noteLines.length * 4 + 2;
+  }
+  doc.text(`FP-block reduction if AI enabled: ${pct(wc.fpReductionOpportunityPct)}   |   AI-benign got origin 200: ${pct(wc.aiBenignOrigin200Pct)}   |   engine<->AI agreement: ${pct(wc.agreementPct)}   |   already AutoSuppressed: ${n(wc.alreadySuppressedByAi)}   |   AI coverage: ${pct(wc.aiDataCoveragePct)}`, PAGE_MARGIN, y);
+  y += 5;
+
+  y = autoTable(doc, {
+    startY: y,
+    head: [['Engine state \\ AI verdict', 'AI: Attack (high/med)', 'AI: Benign (low/FP)']],
+    body: [
+      ['Signature Enabled', `${n(wc.matrix.bothAttack)}  (agree: attack)`, `${n(wc.matrix.engineActiveAiBenign)}  (AI would prevent FP block)`],
+      ['AutoSuppressed', `${n(wc.matrix.aiSuppressedRiskAttack)}  (conflict)`, `${n(wc.matrix.bothBenign)}  (agree: benign)`],
+    ],
+    theme: 'grid',
+    headStyles: { fillColor: [...BLUE], textColor: 255, fontSize: 7 },
+    styles: { fontSize: 7, cellPadding: 1.5 },
+    margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+  });
+
+  const div = wc.bySignature.filter(s => s.engineActiveAiBenign > 0).slice(0, 12);
+  if (div.length > 0) {
+    doc.setFontSize(8); doc.setFont('helvetica', 'bold'); doc.setTextColor(...GRAY);
+    y = ensureSpace(doc, y + 2, 12);
+    doc.text('Tuning candidates — Enabled signatures the AI rates benign:', PAGE_MARGIN, y); y += 3;
+    y = autoTable(doc, {
+      startY: y,
+      head: [['Sig ID', 'Name', 'Events', 'Enabled', 'AI Benign', 'Origin 200%']],
+      body: div.map(s => [s.sigId, truncate(s.name, 40), n(s.events), n(s.enabled), n(s.aiBenign), pct(s.origin200Pct)]),
+      theme: 'striped',
+      headStyles: { fillColor: [...BLUE], textColor: 255, fontSize: 7 },
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+      columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+    });
+  }
+  return y + 5;
+}
+
+function addBotClassification(doc: jsPDF, summary: SummaryResult, y: number): number {
+  const ba = summary.botAnalysis;
+  if (!ba || ba.maliciousEvents === 0) return y;
+  y = sectionTitle(doc, 'Bot Classification', y);
+
+  const cc = ba.classificationCounts;
+  doc.setFontSize(9); doc.setFont('helvetica', 'normal'); doc.setTextColor(...DARK);
+  const recLines = doc.splitTextToSize(ba.recommendation, CONTENT_WIDTH) as string[];
+  doc.text(recLines, PAGE_MARGIN, y); y += recLines.length * 4.5 + 3;
+
+  doc.setFontSize(8); doc.setTextColor(...GRAY);
+  doc.text(`Malicious: ${n(cc.malicious)}  |  Suspicious: ${n(cc.suspicious)}  |  Benign/Good: ${n(cc.benign)}  |  Human: ${n(cc.human)}  |  Unknown: ${n(cc.unknown)}    (only Malicious is blocked; from aggregation)`, PAGE_MARGIN, y);
+  y += 4;
+  doc.text(`${n(ba.maliciousEvents)} malicious events from ${n(ba.maliciousIps)}${ba.ipsCapped ? '+' : ''} distinct client(s).`, PAGE_MARGIN, y);
+  y += 5;
+
+  if (ba.fpRiskFlags.length > 0) {
+    y = ensureSpace(doc, y, 16);
+    doc.setFontSize(8); doc.setFont('helvetica', 'bold'); doc.setTextColor(...RED);
+    doc.text('Potential false positives in the Malicious set — verify before blocking:', PAGE_MARGIN, y); y += 3;
+    doc.setFont('helvetica', 'normal');
+    y = autoTable(doc, {
+      startY: y,
+      head: [['Type', 'User-Agent / Bot Name', 'Events']],
+      body: ba.fpRiskFlags.map(f => [f.kind === 'known_good_bot' ? 'Known-good bot' : 'Real browser', truncate(f.label, 60), n(f.count)]),
+      theme: 'grid',
+      headStyles: { fillColor: [...RED], textColor: 255, fontSize: 7 },
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+      columnStyles: { 2: { halign: 'right' } },
+    });
+  }
+
+  const ips = ba.topMaliciousIps.slice(0, 15);
+  if (ips.length > 0) {
+    y = ensureSpace(doc, y + 1, 16);
+    doc.setFontSize(8); doc.setFont('helvetica', 'bold'); doc.setTextColor(...GRAY);
+    doc.text('Top malicious source IPs:', PAGE_MARGIN, y); y += 3;
+    doc.setFont('helvetica', 'normal');
+    y = autoTable(doc, {
+      startY: y,
+      head: [['Source IP', 'Events']],
+      body: ips.map(b => [b.key, n(b.count)]),
+      theme: 'striped',
+      headStyles: { fillColor: [...BLUE], textColor: 255, fontSize: 7 },
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      margin: { left: PAGE_MARGIN, right: PAGE_MARGIN },
+      columnStyles: { 1: { halign: 'right' } },
+    });
+  }
   return y + 5;
 }
 
@@ -277,13 +426,13 @@ function addSignatureDetails(doc: jsPDF, details: SignatureAnalysisUnit[], y: nu
     doc.setFontSize(7);
     doc.setTextColor(...GRAY);
     const signalList = [
-      { label: 'User Breadth (20%)', score: unit.signals.userBreadth.score, reason: unit.signals.userBreadth.reason },
-      { label: 'Request Breadth (15%)', score: unit.signals.requestBreadth.score, reason: unit.signals.requestBreadth.reason },
-      { label: 'Path Breadth (15%)', score: unit.signals.pathBreadth.score, reason: unit.signals.pathBreadth.reason },
-      { label: 'Context Analysis (15%)', score: unit.signals.contextAnalysis.score, reason: unit.signals.contextAnalysis.reason },
-      { label: 'Client Profile (10%)', score: unit.signals.clientProfile.score, reason: unit.signals.clientProfile.reason },
-      { label: 'Temporal Pattern (10%)', score: unit.signals.temporalPattern.score, reason: unit.signals.temporalPattern.reason },
-      { label: 'Sig Accuracy (15%)', score: unit.signals.signatureAccuracy.score, reason: unit.signals.signatureAccuracy.reason },
+      { label: 'Client Breadth (15%)', score: unit.signals.clientBreadth.score, reason: unit.signals.clientBreadth.reason },
+      { label: 'Path Breadth (10%)', score: unit.signals.pathBreadth.score, reason: unit.signals.pathBreadth.reason },
+      { label: 'Context (10%)', score: unit.signals.context.score, reason: unit.signals.context.reason },
+      { label: 'Matching Evidence (15%)', score: unit.signals.matchingEvidence.score, reason: unit.signals.matchingEvidence.reason },
+      { label: 'Origin Response (15%)', score: unit.signals.originResponse.score, reason: unit.signals.originResponse.reason },
+      { label: 'Client Behavior (20%)', score: unit.signals.clientBehavior.score, reason: unit.signals.clientBehavior.reason },
+      { label: 'Detection Confidence (15%)', score: unit.signals.detectionConfidence.score, reason: unit.signals.detectionConfidence.reason },
     ];
     for (const s of signalList) {
       y = ensureSpace(doc, y, 4);
@@ -795,6 +944,9 @@ export function generateFPAnalysisPDF(opts: FPReportOptions): void {
 
   let y = addHeader(doc, opts);
   y = addExecutiveSummary(doc, opts.summary, opts.scopes, y);
+  y = addRecommendations(doc, opts.summary, y);
+  y = addWafComparison(doc, opts.summary, y);
+  y = addBotClassification(doc, opts.summary, y);
 
   if (opts.scopes.includes('waf_signatures')) {
     y = addSignaturesSection(doc, opts.summary.signatures, y);

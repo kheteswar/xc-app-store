@@ -40,8 +40,8 @@ export function exportAnalysisCSV(results: FPAnalysisResults): string {
       'Events', 'Flagged Users', 'Total Users', 'User Ratio',
       'Total Requests', 'Request Ratio',
       'Composite Score', 'Verdict',
-      'User Breadth', 'Request Breadth', 'Path Breadth',
-      'Context Analysis', 'Client Profile', 'Temporal Pattern', 'Sig Accuracy',
+      'Client Breadth', 'Path Breadth', 'Context',
+      'Matching Evidence', 'Origin Response', 'Client Behavior', 'Detection Confidence',
       'Override', 'AI Confirmed',
     ]));
     for (const u of results.signatureUnits) {
@@ -51,9 +51,9 @@ export function exportAnalysisCSV(results: FPAnalysisResults): string {
         u.eventCount, u.flaggedUsers, u.totalUsersOnPath, u.userRatio.toFixed(4),
         u.totalRequestsOnPath, u.requestRatio.toFixed(4),
         u.signals.compositeScore, u.signals.verdict,
-        u.signals.userBreadth.score, u.signals.requestBreadth.score, u.signals.pathBreadth.score,
-        u.signals.contextAnalysis.score, u.signals.clientProfile.score, u.signals.temporalPattern.score, u.signals.signatureAccuracy.score,
-        u.signals.overrideApplied || '', u.aiConfirmed,
+        u.signals.clientBreadth.score, u.signals.pathBreadth.score, u.signals.context.score,
+        u.signals.matchingEvidence.score, u.signals.originResponse.score, u.signals.clientBehavior.score, u.signals.detectionConfidence.score,
+        u.signals.override || '', u.aiConfirmed,
       ]));
     }
     lines.push('');

@@ -65,6 +65,84 @@ export function generateSignatureExclusion(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// GENERATE ATTACK-TYPE EXCLUSION + ROLLUP
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Exclude an entire attack type on a path. F5 cascades this to ALL signatures
+ * of that type — broader than a per-signature exclusion, so only use it when many
+ * distinct signatures of one attack type are all firing as FPs on the same path.
+ */
+export function generateAttackTypeExclusion(
+  attackType: string,
+  domain: string,
+  path: string,
+  methods: string[],
+): WafExclusionRule {
+  const slug = attackType.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 6);
+  const hash = slug + Math.random().toString(36).slice(2, 6);
+  return {
+    metadata: {
+      name: `fp-atk-${hash}`,
+      disable: false,
+      description: `FP Analyzer: Exclude attack type ${attackType} on ${path} (rolled up from multiple FP signatures)`,
+    },
+    ...buildDomainField(domain),
+    ...buildPathField(path),
+    methods: methods.length > 0 ? methods : [],
+    app_firewall_detection_control: {
+      exclude_signature_contexts: [],
+      exclude_violation_contexts: [],
+      exclude_attack_type_contexts: [{ context: 'CONTEXT_ANY', exclude_attack_type: attackType }],
+      exclude_bot_name_contexts: [],
+    },
+  };
+}
+
+export interface SigExclusionIntent {
+  signatureId: string;
+  attackType: string;
+  contextType: string;
+  contextName: string;
+  path: string;
+  methods: string[];
+}
+
+/**
+ * Build signature exclusions with attack-type rollup. When >= minSigsPerAttackType
+ * DISTINCT signatures of the same attack_type are excluded on the same path+methods,
+ * collapse them into one attack-type exclusion (fewer, broader rules — F5 best
+ * practice). Smaller groups stay as precise per-signature exclusions.
+ */
+export function buildSignatureExclusionsWithRollup(
+  intents: SigExclusionIntent[],
+  domain = '',
+  minSigsPerAttackType = 3,
+): WafExclusionRule[] {
+  const groups = new Map<string, SigExclusionIntent[]>();
+  for (const it of intents) {
+    const methodsKey = [...it.methods].sort().join(',');
+    const key = `${it.path}|${methodsKey}|${it.attackType || ''}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(it);
+  }
+
+  const rules: WafExclusionRule[] = [];
+  for (const group of groups.values()) {
+    const distinctSigs = new Set(group.map(i => i.signatureId));
+    const first = group[0];
+    if (first.attackType && distinctSigs.size >= minSigsPerAttackType) {
+      rules.push(generateAttackTypeExclusion(first.attackType, domain, first.path, first.methods));
+    } else {
+      for (const it of group) {
+        rules.push(generateSignatureExclusion(it.signatureId, it.contextType, it.contextName, domain, it.path, it.methods));
+      }
+    }
+  }
+  return groupExclusionRules(rules);
+}
+
+// ═══════════════════════════════════════════════════════════════
 // GENERATE VIOLATION EXCLUSION
 // ═══════════════════════════════════════════════════════════════
 

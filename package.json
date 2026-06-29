@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "start": "vite"
+    "start": "vite",
+    "typecheck": "tsc -p tsconfig.all.json",
+    "test:fp": "npx tsx scripts/test-fp-accuracy.mts",
+    "test:rl": "npx tsx scripts/test-rate-limit.mts"
   },
   "dependencies": {
     "@types/js-yaml": "^4.0.9",
