@@ -214,8 +214,12 @@ export function getLBPosture(obj: unknown): LBPosture {
   // when absent, so absence is NOT a gap. Only an explicit "no request timeout"
   // (disable_request_timeout) removes the total-request Slowloris guard.
   const slow = asRec(spec.slow_ddos_mitigation);
+  // Any explicitly-tuned timeout counts as configured slow-DDoS mitigation —
+  // not just the request-headers / total-request timeouts.
   const slowDdosEnabled = isNonEmptyObject(slow) &&
-    (slow.request_headers_timeout !== undefined || slow.request_timeout !== undefined);
+    (slow.request_headers_timeout !== undefined ||
+      slow.request_timeout !== undefined ||
+      slow.request_body_timeout !== undefined);
   const slowDdosRequestTimeoutDisabled = keyPresent(slow, 'disable_request_timeout');
 
   // Bot
@@ -312,8 +316,11 @@ export function getLBPosture(obj: unknown): LBPosture {
     .filter(Boolean);
   const SEC_HEADERS = ['x-frame-options', 'x-content-type-options', 'content-security-policy', 'referrer-policy', 'permissions-policy', 'strict-transport-security'];
   const hasCommonSecurityHeaders = SEC_HEADERS.some((h) => securityHeaderNames.includes(h));
+  // Suppression = the Server header is REMOVED, or overwritten with a static value
+  // via append=false. Merely appending a Server header does not hide the origin's.
   const serverHeaderSuppressed =
-    respRemove.includes('server') || securityHeaderNames.includes('server');
+    respRemove.includes('server') ||
+    respAdd.some((h) => String(h.name || '').toLowerCase() === 'server' && h.append === false);
   const addLocationEnabled = spec.add_location === true;
 
   // Request size limit (buffer policy)
@@ -332,12 +339,16 @@ export function getLBPosture(obj: unknown): LBPosture {
     cookies.length > 0 &&
     cookies.every((c) => keyPresent(c, 'add_secure') && keyPresent(c, 'add_httponly'));
 
-  // Routes that disable WAF (per-route override)
+  // Routes that disable WAF (per-route override). The WAF-disabling
+  // advanced_options can sit on any route-type wrapper (simple_route,
+  // redirect_route, direct_response_route, custom_route_object), so inspect
+  // each wrapper rather than only simple_route.
   const routesArr = Array.isArray(spec.routes) ? (spec.routes as Rec[]) : [];
+  const ROUTE_WRAPPERS = ['simple_route', 'redirect_route', 'direct_response_route', 'custom_route_object'];
   let routeWafDisabledCount = 0;
   for (const r of routesArr) {
-    const ao = asRec(asRec(r.simple_route).advanced_options);
-    if (keyPresent(ao, 'disable_waf')) routeWafDisabledCount++;
+    const disablesWaf = ROUTE_WRAPPERS.some((w) => keyPresent(asRec(asRec(r[w]).advanced_options), 'disable_waf'));
+    if (disablesWaf) routeWafDisabledCount++;
   }
 
   // Path normalization can sit on the HTTPS/TLS block, the spec root (deprecated
@@ -587,7 +598,10 @@ export interface ServicePolicyPosture {
   hasBroadAllowPrefix: boolean;
 }
 
-const BROAD_PREFIXES = new Set(['0.0.0.0/0', '::/0', '0.0.0.0/1', '0/0']);
+// Only true allow-all source prefixes belong here. NOTE: 0.0.0.0/1 is the LOWER
+// HALF of the IPv4 space (0–127.x), NOT allow-all — including it produced a false
+// HIGH "trusts 0.0.0.0/0" failure on legitimately-scoped ALLOW rules.
+const BROAD_PREFIXES = new Set(['0.0.0.0/0', '::/0', '0/0']);
 
 export function getServicePolicyPosture(obj: unknown): ServicePolicyPosture {
   const spec = getSpec(obj);
@@ -651,9 +665,9 @@ export function getWafPosture(obj: unknown): WafPosture {
   const spec = getSpec(obj);
 
   let mode: WafMode = 'UNKNOWN';
-  if ('blocking' in spec) mode = 'BLOCKING';
-  else if ('monitoring' in spec) mode = 'MONITORING';
-  else if ('ai_risk_based_blocking' in spec) mode = 'AI_RISK_BASED';
+  if (keyPresent(spec, 'blocking')) mode = 'BLOCKING';
+  else if (keyPresent(spec, 'monitoring')) mode = 'MONITORING';
+  else if (keyPresent(spec, 'ai_risk_based_blocking')) mode = 'AI_RISK_BASED';
   else if (typeof spec.mode === 'string') {
     const m = String(spec.mode).toUpperCase();
     mode = m.includes('BLOCK') ? 'BLOCKING' : m.includes('MONITOR') ? 'MONITORING' : 'UNKNOWN';
@@ -727,7 +741,9 @@ export function getWafPosture(obj: unknown): WafPosture {
       : 'disabled'
     : 'unknown';
 
-  const exclusions = spec.rule_activity_exclusions || spec.blocking_page;
+  // WAF rule-activity exclusions (suppressed signatures/violations). `blocking_page`
+  // is a custom response page, NOT an exclusions list, so it must not be a fallback.
+  const exclusions = spec.rule_activity_exclusions;
   const exclusionCount = Array.isArray(exclusions) ? exclusions.length : 0;
 
   return {
@@ -788,7 +804,9 @@ export function getLBAdvancedPosture(obj: unknown): LBAdvancedPosture {
   const useMtls = asRec(https.use_mtls || certParams.use_mtls);
   const mtlsEnabled = keyPresent(https, 'use_mtls') || keyPresent(certParams, 'use_mtls');
   const mtlsCrlAttached = isNonEmptyRef(useMtls.crl) || isNonEmptyObject(useMtls.crl);
-  const mtlsClientCertOptional = useMtls.client_certificate_optional === true || keyPresent(useMtls, 'client_certificate_optional');
+  // Only OPTIONAL when the flag is truthy. An explicit `client_certificate_optional: false`
+  // means the client cert is REQUIRED, so key-presence alone must not flag it as optional.
+  const mtlsClientCertOptional = useMtls.client_certificate_optional === true;
 
   const advertiseScope: LBAdvancedPosture['advertiseScope'] =
     keyPresent(spec, 'advertise_on_public_default_vip') ? 'public_default'

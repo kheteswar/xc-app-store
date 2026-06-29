@@ -28,6 +28,7 @@ import {
   Pin,
   EyeOff,
   GitCompare,
+  Swords,
 } from 'lucide-react';
 import { ConnectionPanel } from '../components/ConnectionPanel';
 import { ToolCard } from '../components/ToolCard';
@@ -211,6 +212,18 @@ const tools = [
     tags: [
       { label: 'Audit', type: 'report' as const },
       { label: 'Read-Only', type: 'safe' as const },
+    ],
+    badge: 'New',
+    featured: true,
+  },
+  {
+    name: 'WAF Attack Simulator',
+    description: 'Fire OWASP WAF & API Top 10 attack signatures at an endpoint, then reconcile XC logs to see what was blocked vs. reached origin.',
+    icon: Swords,
+    to: '/waf-attack-simulator',
+    tags: [
+      { label: 'Active Test', type: 'update' as const },
+      { label: 'WAF', type: 'report' as const },
     ],
     badge: 'New',
     featured: true,

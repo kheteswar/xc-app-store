@@ -9,6 +9,7 @@ import { WAFScanner } from './pages/WAFScanner';
 import { ConfigVisualizer } from './pages/ConfigVisualizer';
 import { CopyConfig } from './pages/CopyConfig';
 import { SecurityAuditor } from './pages/SecurityAuditor';
+import { WafAttackSimulator } from './pages/WafAttackSimulator';
 import { PropertyViewer } from './pages/PropertyViewer';
 import { ConfigComparator } from './pages/ConfigComparator';
 import { HttpSanityChecker } from './pages/HttpSanityChecker';
@@ -54,6 +55,7 @@ function App() {
                 <Route path="/config-visualizer" element={<ConfigVisualizer />} />
                 <Route path="/copy-config" element={<CopyConfig />} />
                 <Route path="/security-auditor" element={<SecurityAuditor />} />
+                <Route path="/waf-attack-simulator" element={<WafAttackSimulator />} />
                 <Route path="/property-viewer" element={<PropertyViewer />} />
                 <Route path="/config-comparator" element={<ConfigComparator />} />
                 <Route path="/http-sanity-checker" element={<HttpSanityChecker />} />

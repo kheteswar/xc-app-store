@@ -580,9 +580,25 @@ export default defineConfig({
               const parsed = JSON.parse(body);
               
               // Destructure and validate
-              const { url: targetUrl, method = 'GET', headers = {}, targetIp } = parsed;
-              
+              const { url: targetUrl, method = 'GET', headers = {}, targetIp, body: reqBody } = parsed;
+
               if (!targetUrl) throw new Error('Missing URL parameter');
+
+              // Serialize an optional request body (used by the WAF Attack Simulator
+              // to deliver payloads in POST/PUT bodies). Strings are sent verbatim;
+              // objects are JSON-encoded. Content-Length is set so origins/WAFs that
+              // reject chunked bodies still see the payload.
+              const outgoingBody =
+                reqBody === undefined || reqBody === null
+                  ? undefined
+                  : typeof reqBody === 'string'
+                  ? reqBody
+                  : JSON.stringify(reqBody);
+              const bodyHeaders: Record<string, string> = {};
+              if (outgoingBody !== undefined) {
+                const hasCL = Object.keys(headers).some((h) => h.toLowerCase() === 'content-length');
+                if (!hasCL) bodyHeaders['Content-Length'] = String(Buffer.byteLength(outgoingBody));
+              }
 
               console.log(`[SanityProxy] ${method} ${targetUrl}`);
               console.log(`[SanityProxy] Raw targetIp:`, targetIp, `(type: ${typeof targetIp})`);
@@ -605,6 +621,7 @@ export default defineConfig({
                   method,
                   headers: {
                     ...headers,
+                    ...bodyHeaders,
                     // Ensure Host header is set to the original hostname
                     'Host': headers['Host'] || urlObj.hostname
                   },
@@ -692,6 +709,7 @@ export default defineConfig({
                   }
                 });
 
+                if (outgoingBody !== undefined) proxyReq.write(outgoingBody);
                 proxyReq.end();
               } else {
                 // Live DNS request - use Google DNS resolver to bypass local /etc/hosts
@@ -721,6 +739,7 @@ export default defineConfig({
                   method,
                   headers: {
                     ...headers,
+                    ...bodyHeaders,
                     'Host': urlObj.hostname // Keep original hostname in Host header
                   },
                   servername: urlObj.hostname, // SNI for HTTPS
@@ -810,6 +829,7 @@ export default defineConfig({
                   }
                 });
 
+                if (outgoingBody !== undefined) proxyReq.write(outgoingBody);
                 proxyReq.end();
               }
             } catch (e: any) {
