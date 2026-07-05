@@ -53,8 +53,8 @@ export function buildFpRecommendations(input: {
   ];
   if (comparison && comparison.matrix.aiSuppressedRiskAttack > 0) {
     investigateList.push({
-      kind: 'conflict', id: '-', name: `${comparison.matrix.aiSuppressedRiskAttack} AutoSuppressed signature(s) the AI now rates as attacks`,
-      reason: 'The signature auto-tuning suppressed these, but the AI risk engine flags them as attacks — review before trusting the suppression.',
+      kind: 'conflict', id: '-', name: `${comparison.matrix.aiSuppressedRiskAttack} request(s) the traditional engine would NOT block but the AI rates as attacks`,
+      reason: 'The signature/violation engine would let these through (AutoSuppressed, Staging, or no enforced detection), but the AI risk engine flags them as attacks — review whether the traditional WAF is missing a real threat.',
     });
   }
 
@@ -90,12 +90,16 @@ export function buildFpRecommendations(input: {
     title: `Enable AI-powered WAF blocking at ${aiBlockingThreshold === 'high_medium' ? 'High + Medium' : 'High'} risk`,
     detail: `${aiThresholdReason} Keep Automatic Attack Signature Tuning ON so the AI continues to auto-suppress new false positives as traffic evolves.`,
   });
-  if (botAnalysis && botAnalysis.maliciousEvents > 0 && botAnalysis.maliciousIps > 0) {
-    const ipLabel = `${botAnalysis.maliciousIps.toLocaleString()}${botAnalysis.ipsCapped ? '+' : ''}`;
+  if (botAnalysis && botAnalysis.maliciousEvents > 0) {
+    // Prefer a distinct-client count, but fall back to the event count when src_ip wasn't collected
+    // (maliciousIps can be 0 while maliciousEvents > 0) — the step must still appear.
+    const ipLabel = botAnalysis.maliciousIps > 0
+      ? `${botAnalysis.maliciousIps.toLocaleString()}${botAnalysis.ipsCapped ? '+' : ''} bad bot client${botAnalysis.maliciousIps > 1 ? 's' : ''}`
+      : `${botAnalysis.maliciousEvents.toLocaleString()} malicious bot event${botAnalysis.maliciousEvents > 1 ? 's' : ''}`;
     if (botAnalysis.fpRiskFlags.length === 0) {
       steps.push({
         num: num++, kind: 'block_bots',
-        title: `Enable Malicious-bot blocking — safe (${ipLabel} bad bot client${botAnalysis.maliciousIps > 1 ? 's' : ''})`,
+        title: `Enable Malicious-bot blocking — safe (${ipLabel})`,
         detail: `Every Malicious-classified client carries a scanner/unknown user-agent — no known-good crawler or real-browser client appears in the Malicious set, so blocking won't affect legitimate traffic. Set the Bot Defense action for Malicious to Block; keep Suspicious and Good/Benign on their default (allow/ignore).`,
       });
     } else {

@@ -30,26 +30,83 @@ function buildPathField(path: string): Pick<WafExclusionRule, 'any_path' | 'path
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PATH COLLAPSING — fold many same-subtree FP paths into ONE rule
+// ═══════════════════════════════════════════════════════════════
+
+// When a signature/violation is an FP across many distinct paths under one directory (e.g. a scanner
+// hitting 148 paths under /php/examples), emitting one exclusion per path is impractical. Collapse them
+// into a single directory-subtree rule. ≥ this many same-prefix FP paths triggers a collapse.
+const COLLAPSE_PATH_THRESHOLD = 4;
+
+/** Longest common directory prefix by path segment: ['/a/b/x','/a/b/y/z'] → '/a/b'. */
+function longestCommonDirPrefix(paths: string[]): string {
+  const segLists = paths.map(p => p.split('/').filter(Boolean));
+  if (segLists.length === 0) return '';
+  let common = segLists[0];
+  for (let k = 1; k < segLists.length && common.length > 0; k++) {
+    const segs = segLists[k];
+    let i = 0;
+    while (i < common.length && i < segs.length && common[i] === segs[i]) i++;
+    common = common.slice(0, i);
+  }
+  return '/' + common.join('/');
+}
+
+type CollapsedPath = { kind: 'prefix'; prefix: string; paths: string[] } | { kind: 'exact'; path: string };
+
+/** Group FP paths by first segment; any group of ≥ threshold collapses to its longest common directory
+ *  prefix (one subtree rule). Smaller groups stay per-path (precise). */
+function collapseFpPaths(paths: string[], threshold = COLLAPSE_PATH_THRESHOLD): CollapsedPath[] {
+  const uniq = [...new Set(paths.filter(p => p && p !== '/'))];
+  if (uniq.length < threshold) return uniq.map(path => ({ kind: 'exact', path }));
+  const groups = new Map<string, string[]>();
+  for (const p of uniq) {
+    const key = '/' + (p.split('/').filter(Boolean)[0] || '');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(p);
+  }
+  const out: CollapsedPath[] = [];
+  for (const [firstSeg, members] of groups) {
+    if (members.length >= threshold) {
+      const lcp = longestCommonDirPrefix(members);
+      out.push({ kind: 'prefix', prefix: lcp.length > 1 ? lcp : firstSeg, paths: members });
+    } else {
+      for (const path of members) out.push({ kind: 'exact', path });
+    }
+  }
+  return out;
+}
+
+/**
+ * F5 XC RE2 path_regex matching a directory AND everything beneath it:
+ *   /php/examples → ^/php/examples(/.*)?$
+ * Anchored full-match; regex metacharacters in the literal prefix are escaped. RE2-compatible (no
+ * lookaround/backrefs), so it is accepted by the F5 XC Distributed Cloud HTTP WAF exclusion-rule
+ * path_regex field. The (/.*)? group matches the bare directory and any sub-path without over-matching
+ * a sibling like /php/examplesX.
+ */
+function prefixPathRegexField(prefix: string): Pick<WafExclusionRule, 'path_regex'> {
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return { path_regex: `^${escaped}(/.*)?$` };
+}
+
+// ═══════════════════════════════════════════════════════════════
 // GENERATE SIGNATURE EXCLUSION
 // ═══════════════════════════════════════════════════════════════
 
-export function generateSignatureExclusion(
-  sigId: string,
-  context: string,
-  contextName: string,
-  domain: string,
-  path: string,
-  methods: string[],
+function buildSignatureRule(
+  sigId: string, context: string, contextName: string, domain: string,
+  pathField: Pick<WafExclusionRule, 'any_path' | 'path_prefix' | 'path_regex'>, pathLabel: string, methods: string[],
 ): WafExclusionRule {
   const hash = sigId.slice(-6) + Math.random().toString(36).slice(2, 6);
   return {
     metadata: {
       name: `fp-sig${sigId}-${hash}`,
       disable: false,
-      description: `FP Analyzer: Exclude signature ${sigId} for ${context} "${contextName}" on ${path}`,
+      description: `FP Analyzer: Exclude signature ${sigId} for ${context} "${contextName}" on ${pathLabel}`,
     },
     ...buildDomainField(domain),
-    ...buildPathField(path),
+    ...pathField,
     methods: methods.length > 0 ? methods : [],
     app_firewall_detection_control: {
       exclude_signature_contexts: [{
@@ -62,6 +119,17 @@ export function generateSignatureExclusion(
       exclude_bot_name_contexts: [],
     },
   };
+}
+
+export function generateSignatureExclusion(
+  sigId: string,
+  context: string,
+  contextName: string,
+  domain: string,
+  path: string,
+  methods: string[],
+): WafExclusionRule {
+  return buildSignatureRule(sigId, context, contextName, domain, buildPathField(path), path, methods);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -146,23 +214,19 @@ export function buildSignatureExclusionsWithRollup(
 // GENERATE VIOLATION EXCLUSION
 // ═══════════════════════════════════════════════════════════════
 
-export function generateViolationExclusion(
-  violationName: string,
-  context: string,
-  contextName: string,
-  domain: string,
-  path: string,
-  methods: string[],
+function buildViolationRule(
+  violationName: string, context: string, contextName: string, domain: string,
+  pathField: Pick<WafExclusionRule, 'any_path' | 'path_prefix' | 'path_regex'>, pathLabel: string, methods: string[],
 ): WafExclusionRule {
   const hash = Math.random().toString(36).slice(2, 8);
   return {
     metadata: {
       name: `fp-viol-${hash}`,
       disable: false,
-      description: `FP Analyzer: Exclude ${violationName} on ${path}`,
+      description: `FP Analyzer: Exclude ${violationName} on ${pathLabel}`,
     },
     ...buildDomainField(domain),
-    ...buildPathField(path),
+    ...pathField,
     methods: methods.length > 0 ? methods : [],
     app_firewall_detection_control: {
       exclude_signature_contexts: [],
@@ -175,6 +239,17 @@ export function generateViolationExclusion(
       exclude_bot_name_contexts: [],
     },
   };
+}
+
+export function generateViolationExclusion(
+  violationName: string,
+  context: string,
+  contextName: string,
+  domain: string,
+  path: string,
+  methods: string[],
+): WafExclusionRule {
+  return buildViolationRule(violationName, context, contextName, domain, buildPathField(path), path, methods);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -227,17 +302,23 @@ export function generatePerPathExclusions(
   const rules: WafExclusionRule[] = [];
   if (!unit.pathAnalyses) return rules;
 
-  for (const pa of unit.pathAnalyses) {
-    if (pa.verdict !== 'highly_likely_fp' && pa.verdict !== 'likely_fp') continue;
+  const fpPas = unit.pathAnalyses.filter(pa => pa.verdict === 'highly_likely_fp' || pa.verdict === 'likely_fp');
+  if (fpPas.length === 0) return rules;
+  const paByPath = new Map(fpPas.map(pa => [pa.path, pa]));
 
-    rules.push(generateSignatureExclusion(
-      unit.signatureId,
-      unit.contextType,
-      unit.contextName,
-      domain || '',
-      pa.path,
-      Object.keys(pa.methods),
-    ));
+  for (const c of collapseFpPaths([...paByPath.keys()])) {
+    if (c.kind === 'prefix') {
+      const methods = [...new Set(c.paths.flatMap(p => Object.keys(paByPath.get(p)?.methods ?? {})))];
+      rules.push(buildSignatureRule(
+        unit.signatureId, unit.contextType, unit.contextName, domain || '',
+        prefixPathRegexField(c.prefix),
+        `${c.prefix}/* (${c.paths.length} FP paths collapsed — review: a subtree exclusion whitelists the whole directory)`,
+        methods,
+      ));
+    } else {
+      const pa = paByPath.get(c.path)!;
+      rules.push(generateSignatureExclusion(unit.signatureId, unit.contextType, unit.contextName, domain || '', c.path, Object.keys(pa.methods)));
+    }
   }
 
   return groupExclusionRules(rules);
@@ -254,17 +335,23 @@ export function generateViolationPerPathExclusions(
   const rules: WafExclusionRule[] = [];
   if (!unit.pathAnalyses) return rules;
 
-  for (const pa of unit.pathAnalyses) {
-    if (pa.verdict !== 'highly_likely_fp' && pa.verdict !== 'likely_fp') continue;
+  const fpPas = unit.pathAnalyses.filter(pa => pa.verdict === 'highly_likely_fp' || pa.verdict === 'likely_fp');
+  if (fpPas.length === 0) return rules;
+  const paByPath = new Map(fpPas.map(pa => [pa.path, pa]));
 
-    rules.push(generateViolationExclusion(
-      unit.violationName,
-      'CONTEXT_ANY',
-      '',
-      domain || '',
-      pa.path,
-      Object.keys(pa.methods),
-    ));
+  for (const c of collapseFpPaths([...paByPath.keys()])) {
+    if (c.kind === 'prefix') {
+      const methods = [...new Set(c.paths.flatMap(p => Object.keys(paByPath.get(p)?.methods ?? {})))];
+      rules.push(buildViolationRule(
+        unit.violationName, 'CONTEXT_ANY', '', domain || '',
+        prefixPathRegexField(c.prefix),
+        `${c.prefix}/* (${c.paths.length} FP paths collapsed — review: a subtree exclusion whitelists the whole directory)`,
+        methods,
+      ));
+    } else {
+      const pa = paByPath.get(c.path)!;
+      rules.push(generateViolationExclusion(unit.violationName, 'CONTEXT_ANY', '', domain || '', c.path, Object.keys(pa.methods)));
+    }
   }
 
   return groupExclusionRules(rules);

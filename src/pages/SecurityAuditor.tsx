@@ -82,6 +82,13 @@ export function SecurityAuditor() {
   const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
   const [isLoadingNamespaces, setIsLoadingNamespaces] = useState(true);
 
+  // Scope depth: audit every LB in the selected namespaces, or a specific set of load balancers.
+  const [scopeMode, setScopeMode] = useState<'all' | 'specific'>('all');
+  const [availableLbs, setAvailableLbs] = useState<Array<{ namespace: string; name: string }>>([]);
+  const [selectedLbs, setSelectedLbs] = useState<Set<string>>(new Set());
+  const [isLoadingLbs, setIsLoadingLbs] = useState(false);
+  const [lbSearch, setLbSearch] = useState('');
+
   // Granular check selection — individual rule IDs (default: all enabled)
   const [selectedRuleIds, setSelectedRuleIds] = useState<Set<string>>(
     () => new Set(allRules.map((r) => r.id))
@@ -120,6 +127,34 @@ export function SecurityAuditor() {
   useEffect(() => {
     loadNamespaces();
   }, []);
+
+  // When targeting specific LBs, load the LB list for the selected namespaces (cheap list call) and
+  // prune any previously-selected LB that is no longer in scope.
+  useEffect(() => {
+    if (scopeMode !== 'specific' || selectedNamespaces.length === 0) { setAvailableLbs([]); return; }
+    let cancelled = false;
+    (async () => {
+      setIsLoadingLbs(true);
+      try {
+        const lists = await Promise.all(selectedNamespaces.map(async (ns) => {
+          try {
+            const r = await apiClient.getLoadBalancers(ns);
+            return (r.items || [])
+              .map((it: { metadata?: { name?: string }; name?: string }) => ({ namespace: ns, name: it.metadata?.name || it.name || '' }))
+              .filter((x) => x.name);
+          } catch { return []; }
+        }));
+        if (cancelled) return;
+        const flat = lists.flat();
+        setAvailableLbs(flat);
+        const valid = new Set(flat.map((l) => `${l.namespace}/${l.name}`));
+        setSelectedLbs((prev) => new Set([...prev].filter((k) => valid.has(k))));
+      } finally {
+        if (!cancelled) setIsLoadingLbs(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [scopeMode, selectedNamespaces]);
 
   // Close the export menu on outside click
   useEffect(() => {
@@ -169,6 +204,10 @@ export function SecurityAuditor() {
       toast.error('Please select at least one security check');
       return;
     }
+    if (scopeMode === 'specific' && selectedLbs.size === 0) {
+      toast.error('Please select at least one load balancer, or switch to "All load balancers"');
+      return;
+    }
 
     setStep('running');
     setProgress({ phase: 'fetching', message: 'Starting audit...', progress: 0 });
@@ -179,13 +218,16 @@ export function SecurityAuditor() {
 
     const options: AuditOptions = {
       ruleIds: selectedRuleIds.size < allRules.length ? [...selectedRuleIds] : undefined,
+      loadBalancers: scopeMode === 'specific' && selectedLbs.size > 0
+        ? [...selectedLbs].map((k) => { const i = k.indexOf('/'); return { namespace: k.slice(0, i), name: k.slice(i + 1) }; })
+        : undefined,
     };
 
     try {
       const result = await engine.runAudit(selectedNamespaces, options);
       setReport(result);
       setStep('results');
-      toast.success(`Audit complete! Score: ${result.score}/100`);
+      toast.success(result.scoredCount === 0 ? 'Audit complete — no checks could be scored' : `Audit complete! Score: ${result.score}/100`);
     } catch (err) {
       if ((err as Error).message === 'Audit aborted') {
         toast.info('Audit cancelled');
@@ -538,6 +580,11 @@ export function SecurityAuditor() {
           </div>
           <RiskBadge risk={finding.risk} />
           <EntitlementBadge entitlement={finding.entitlement} />
+          {finding.verify && finding.verify !== 'auto' && (
+            <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-sky-500/20 text-sky-300 shrink-0 whitespace-nowrap" title={finding.verifyNote || 'Needs manual verification'}>
+              ⚑ Verify
+            </span>
+          )}
           {isExpanded ? (
             <ChevronDown className="w-5 h-5 text-slate-400 shrink-0" />
           ) : (
@@ -552,6 +599,12 @@ export function SecurityAuditor() {
                 <div className="text-sm font-medium text-slate-400 mb-1">Finding</div>
                 <div className="text-slate-200">{finding.message}</div>
               </div>
+              {finding.verify && finding.verify !== 'auto' && finding.verifyNote && (
+                <div className="bg-sky-500/10 border border-sky-500/30 rounded-lg p-3">
+                  <div className="text-sm font-medium text-sky-300 mb-1">⚑ Needs manual verification{finding.verify === 'assisted' ? ' (config read, effect unconfirmed)' : ''}</div>
+                  <div className="text-sm text-slate-300">{finding.verifyNote}</div>
+                </div>
+              )}
               {(finding.currentValue !== undefined || finding.expectedValue !== undefined) && (
                 <div className="grid md:grid-cols-2 gap-4">
                   {finding.currentValue !== undefined && (
@@ -784,6 +837,51 @@ export function SecurityAuditor() {
               )}
             </div>
 
+            {/* Audit scope — all LBs in the selected namespace(s), or a specific set */}
+            {selectedNamespaces.length > 0 && (
+              <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
+                <h2 className="text-lg font-semibold text-slate-100 mb-3">Audit Scope</h2>
+                <div className="flex flex-wrap gap-2 mb-3">
+                  <button onClick={() => setScopeMode('all')} className={`px-3 py-1.5 text-sm rounded-lg border ${scopeMode === 'all' ? 'bg-blue-500/20 border-blue-500/50 text-blue-300' : 'bg-slate-700/50 border-transparent text-slate-300 hover:bg-slate-700'}`}>All load balancers in namespace</button>
+                  <button onClick={() => setScopeMode('specific')} className={`px-3 py-1.5 text-sm rounded-lg border ${scopeMode === 'specific' ? 'bg-blue-500/20 border-blue-500/50 text-blue-300' : 'bg-slate-700/50 border-transparent text-slate-300 hover:bg-slate-700'}`}>Specific load balancers</button>
+                </div>
+                {scopeMode === 'specific' && (
+                  <div>
+                    <p className="text-xs text-slate-500 mb-3">Only the selected load balancers (and their attached objects) are audited. Tenant-wide and namespace-level checks (logging, alerting, DNS, IAM) still run at their full scope.</p>
+                    {isLoadingLbs ? (
+                      <div className="flex items-center gap-2 text-sm text-slate-400 py-4"><Loader2 className="w-4 h-4 animate-spin" /> Loading load balancers…</div>
+                    ) : availableLbs.length === 0 ? (
+                      <div className="text-sm text-slate-500 py-4">No load balancers found in the selected namespace(s).</div>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-3 mb-2">
+                          <input value={lbSearch} onChange={(e) => setLbSearch(e.target.value)} placeholder="Filter load balancers…" className="flex-1 px-3 py-1.5 text-sm bg-slate-700 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500" />
+                          <button onClick={() => setSelectedLbs(new Set(availableLbs.map((l) => `${l.namespace}/${l.name}`)))} className="text-sm text-blue-400 hover:text-blue-300">All</button>
+                          <button onClick={() => setSelectedLbs(new Set())} className="text-sm text-slate-400 hover:text-slate-300">None</button>
+                        </div>
+                        <div className="max-h-72 overflow-y-auto grid grid-cols-1 md:grid-cols-2 gap-1.5">
+                          {availableLbs
+                            .filter((l) => l.name.toLowerCase().includes(lbSearch.toLowerCase()) || l.namespace.toLowerCase().includes(lbSearch.toLowerCase()))
+                            .map((l) => {
+                              const key = `${l.namespace}/${l.name}`;
+                              const checked = selectedLbs.has(key);
+                              return (
+                                <label key={key} className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer text-sm ${checked ? 'bg-blue-500/20 border border-blue-500/50' : 'bg-slate-700/50 border border-transparent hover:bg-slate-700'}`}>
+                                  <input type="checkbox" checked={checked} onChange={() => setSelectedLbs((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; })} className="rounded border-slate-600 text-blue-500 focus:ring-blue-500" />
+                                  <span className="text-slate-200 truncate">{l.name}</span>
+                                  {selectedNamespaces.length > 1 && <span className="text-xs text-slate-500 ml-auto truncate">{l.namespace}</span>}
+                                </label>
+                              );
+                            })}
+                        </div>
+                        <p className="text-xs text-slate-500 mt-2">{selectedLbs.size} load balancer{selectedLbs.size === 1 ? '' : 's'} selected</p>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Security Checks — granular per-category / per-rule selection */}
             <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
               <div className="flex items-center justify-between mb-4">
@@ -979,6 +1077,19 @@ export function SecurityAuditor() {
             {/* ════════════════════ OVERVIEW & SUMMARY ════════════════════ */}
             {resultsView === 'overview' && (
             <div className="space-y-6">
+            {/* Incomplete-audit banner — config that could not be fetched (so the audit is partial) */}
+            {report.fetchErrors.length > 0 && (
+              <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-4 flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+                <div className="text-sm">
+                  <div className="font-semibold text-amber-300 mb-1">Partial audit — {report.fetchErrors.length} fetch issue{report.fetchErrors.length === 1 ? '' : 's'}</div>
+                  <div className="text-slate-300">
+                    {report.fetchErrors.filter((e) => e.fatal).length > 0 && `${report.fetchErrors.filter((e) => e.fatal).length} namespace(s) could not be read and were excluded from the score. `}
+                    Some configuration could not be retrieved, so this audit may be incomplete. Affected: {[...new Set(report.fetchErrors.map((e) => e.namespace))].slice(0, 6).join(', ')}{new Set(report.fetchErrors.map((e) => e.namespace)).size > 6 ? '…' : ''}.
+                  </div>
+                </div>
+              </div>
+            )}
             {/* Summary Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
               {/* Score */}
@@ -987,12 +1098,14 @@ export function SecurityAuditor() {
                   <div>
                     <div className="text-sm text-slate-400 mb-1">Security Score</div>
                     <div className={`text-4xl font-bold ${
+                      report.scoredCount === 0 ? 'text-slate-400' :
                       report.score >= 80 ? 'text-green-400' :
                       report.score >= 60 ? 'text-yellow-400' :
                       report.score >= 40 ? 'text-orange-400' : 'text-red-400'
                     }`}>
-                      {report.score}/100
+                      {report.scoredCount === 0 ? 'N/A' : `${report.score}/100`}
                     </div>
+                    {report.scoredCount === 0 && <div className="text-xs text-slate-500 mt-1">No checks could be scored</div>}
                   </div>
                   <div className="relative w-20 h-20">
                     <svg className="w-full h-full -rotate-90">
@@ -1012,8 +1125,9 @@ export function SecurityAuditor() {
                         stroke="currentColor"
                         strokeWidth="8"
                         fill="none"
-                        strokeDasharray={`${(report.score / 100) * 220} 220`}
+                        strokeDasharray={`${(report.scoredCount === 0 ? 0 : report.score / 100) * 220} 220`}
                         className={
+                          report.scoredCount === 0 ? 'text-slate-600' :
                           report.score >= 80 ? 'text-green-400' :
                           report.score >= 60 ? 'text-yellow-400' :
                           report.score >= 40 ? 'text-orange-400' : 'text-red-400'
@@ -1046,6 +1160,12 @@ export function SecurityAuditor() {
               <div className="bg-slate-800 rounded-xl p-4 border border-slate-700">
                 <div className="text-sm text-slate-400 mb-1">Passed</div>
                 <div className="text-3xl font-bold text-green-400">{report.summary.passed}</div>
+              </div>
+
+              {/* Needs manual verification (config API can't fully confirm these) */}
+              <div className="bg-slate-800 rounded-xl p-4 border border-slate-700">
+                <div className="text-sm text-slate-400 mb-1">Needs Verification</div>
+                <div className="text-3xl font-bold text-sky-400">{report.findings.filter((f) => f.verify && f.verify !== 'auto').length}</div>
               </div>
             </div>
 

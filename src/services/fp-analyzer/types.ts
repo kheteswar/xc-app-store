@@ -9,7 +9,9 @@ export type { AccessLogEntry, SecurityEventEntry };
 // ANALYSIS SCOPE & VERDICTS
 // ═══════════════════════════════════════════════════════════════
 
-export type AnalysisScope = 'waf_signatures' | 'waf_violations' | 'threat_mesh' | 'service_policy' | 'bot_defense' | 'api_security';
+// `signature_bots` = malicious bots detected by Bot Signatures in WAF security events. Deliberately
+// NOT named bot_defense, to avoid confusion with F5 XC's behavioral Bot Defense product.
+export type AnalysisScope = 'waf_signatures' | 'waf_violations' | 'threat_mesh' | 'service_policy' | 'signature_bots' | 'api_security';
 
 export type AnalysisMode = 'quick' | 'hybrid';
 
@@ -17,6 +19,62 @@ export type QuickVerdict = 'likely_fp' | 'likely_tp' | 'investigate';
 export type ConfidenceLevel = 'high' | 'medium' | 'low';
 
 export type FPVerdict = 'highly_likely_fp' | 'likely_fp' | 'ambiguous' | 'likely_tp' | 'confirmed_tp';
+
+/**
+ * Analyst's manual confirmation of a finding, set via the Confirm FP / Confirm TP
+ * buttons in the FP Analyzer detail views and surfaced in the downloaded reports.
+ */
+export type ManualReviewVerdict = 'confirmed_fp' | 'confirmed_tp' | 'skipped';
+/** Map of finding identifier (signature ID or violation name) → analyst verdict. */
+export type ManualReviewMap = Record<string, ManualReviewVerdict>;
+
+// ═══════════════════════════════════════════════════════════════
+// BLOCKING-MODE (ENFORCEMENT) COMPARISON
+// "If we move to Blocking, which policy blocks the attacks with the least
+//  exclusion-rule overhead?" — see enforcement-comparison.ts.
+// ═══════════════════════════════════════════════════════════════
+
+export type BlockingPolicyId = 'legacy_accuracy' | 'ai_risk_high' | 'ai_risk_high_med';
+
+export interface PolicyOutcome {
+  policy: BlockingPolicyId;
+  label: string;
+  description: string;
+  /** Requests this policy would block (each request counted once). */
+  blockedRequests: number;
+  /** Of those, blocks that stop a real attack (≥1 TP-ward signature). */
+  tpBlocked: number;
+  /** Of those, false-positive blocks (all firing signatures FP-ward) — the overhead driver. */
+  fpBlocked: number;
+  /** Of those, neither clearly TP nor clearly FP. */
+  ambiguousBlocked: number;
+  /** Distinct WAF exclusion rules needed to clear this policy's FP blocks (same rollup as the real generator). */
+  exclusionRulesNeeded: number;
+  /** Real-attack requests this policy does NOT block (protection gap). */
+  attacksMissed: number;
+  /** Fraction of all real-attack requests this policy blocks (0..1), or null = N/A (no real attacks in the window). */
+  attackCoveragePct: number | null;
+  /** The FP-ward detections (signatures + violations) this policy would FP-block (drives the exclusion count). */
+  fpDetections: Array<{ kind: 'signature' | 'violation'; id: string; name: string; blockedEvents: number; verdict: FPVerdict }>;
+}
+
+export interface EnforcementComparisonResult {
+  totalRequests: number;
+  /** Requests carrying ≥1 real attack (denominator for attack coverage). */
+  totalTpRequests: number;
+  /** Requests where every firing signature is FP-ward. */
+  totalFpRequests: number;
+  policies: PolicyOutcome[];
+  /** Blocked by legacy but NOT by ai_risk_high — the FP blocks AI avoids (typical win for AI). */
+  legacyOnlyBlocked: number;
+  /** Blocked by ai_risk_high but NOT by legacy — attacks AI catches that accuracy missed (or new FPs). */
+  aiHighOnlyBlocked: number;
+  recommended: BlockingPolicyId;
+  recommendationReason: string;
+  headline: string;
+  /** Plain-language findings + reasoning paragraphs explaining the situation and WHY the recommendation. */
+  narrative: string[];
+}
 
 // ═══════════════════════════════════════════════════════════════
 // PARSED SECURITY EVENT TYPES
@@ -413,7 +471,7 @@ export interface SignatureSummary {
   topPaths: Array<{ path: string; count: number }>;
   autoSuppressed: boolean;
   /** AI-WAF: dominant req_risk level across this signature's events (high/medium/low). */
-  aiRisk?: 'high' | 'medium' | 'low' | 'unknown';
+  aiRisk?: 'high' | 'medium' | 'low' | 'false positive' | 'unknown';
   /** AI-WAF: dominant recommended_action (allow/report/block). */
   recommendedAction?: string;
   /** Signature is in Staging (monitor-only, not actually blocking). */
@@ -439,7 +497,7 @@ export interface ViolationSummary {
   uniquePaths: number;
   topPaths: Array<{ path: string; count: number }>;
   /** AI-WAF: dominant req_risk level across this violation's events. */
-  aiRisk?: 'high' | 'medium' | 'low' | 'unknown';
+  aiRisk?: 'high' | 'medium' | 'low' | 'false positive' | 'unknown';
   quickVerdict: QuickVerdict;
   quickConfidence: ConfidenceLevel;
   fpScore: number;
@@ -497,6 +555,8 @@ export interface SummaryResult {
   recommendations?: FpRecommendations;
   /** Bot classification (bot_info) analysis — is it safe to block Malicious bots? */
   botAnalysis?: BotAnalysisResult;
+  /** Blocking-mode comparison: legacy-accuracy vs AI-risk policies and their exclusion overhead. */
+  enforcementComparison?: EnforcementComparisonResult;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -525,13 +585,24 @@ export interface BotFpRiskFlag {
 export interface BotAnalysisResult {
   /** Event counts by bot classification (from a bot_class distribution aggregation over all WAF events). */
   classificationCounts: { malicious: number; suspicious: number; benign: number; human: number; unknown: number };
-  maliciousEvents: number;          // total Malicious-classified WAF events
+  maliciousEvents: number;          // total Malicious-classified WAF events (EXACT, from total_hits)
   maliciousIps: number;             // distinct Malicious src_ip (bucket count; capped at topk)
   ipsCapped: boolean;               // true if distinct IPs hit the topk cap (undercount)
+  /** True when the per-IP/path breakdown is from a capped SAMPLE (aggregation unavailable on a high-volume
+   *  LB), so the distinct-client count and per-IP counts are a floor, not exact. The total IS exact. */
+  breakdownSampled?: boolean;
+  breakdownSampleSize?: number;
   topMaliciousIps: BotAggBucket[];  // src_ip → events (for the table)
-  topBotNames: BotAggBucket[];      // bot_name → events
+  topBotNames: BotAggBucket[];      // bot_info.name → events
   topUserAgents: BotAggBucket[];    // user_agent → events
   topCountries: BotAggBucket[];     // country → events
+  topBotTypes: BotAggBucket[];      // bot_info.type → events (e.g. "Vulnerability Scanner")
+  topDetectionSources: BotAggBucket[]; // risk_score_info.source → events (e.g. "Bot Signature: testssl")
+  topAsOrgs: BotAggBucket[];        // as_org → events (networks hosting the bots)
+  topPaths: BotAggBucket[];         // req_path → events (the paths the malicious bots targeted)
+  reqRiskDist: BotAggBucket[];      // req_risk distribution among the malicious bots
+  actionDist: BotAggBucket[];       // action the WAF took (allow under monitoring)
+  recommendationDist: BotAggBucket[]; // recommended_action (block) — what enforcing would do
   /** Known-good bots / real-browser UAs detected among the Malicious set → review before blocking. */
   fpRiskFlags: BotFpRiskFlag[];
   recommendation: string;

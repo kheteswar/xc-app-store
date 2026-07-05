@@ -47,6 +47,13 @@ export type ConfigObjectType =
 // but NOT scored (treated like SKIP for the weighted score).
 export type CheckStatus = 'PASS' | 'FAIL' | 'WARN' | 'INFO' | 'SKIP' | 'ERROR';
 
+// How much the config API can actually confirm this control:
+//  auto     — fully determinable from config (the default).
+//  assisted — the config is read, but the real-world effect needs a human eye
+//             (e.g. a rate-limit threshold is present but may be far above real peak).
+//  manual   — not inspectable from config at all; the check exists only to prompt a review.
+export type VerifyLevel = 'auto' | 'assisted' | 'manual';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Check Result - Output from running a rule against one object
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,8 +70,21 @@ export interface CheckResult {
 // Audit Context - Shared context available to all rules
 // ═══════════════════════════════════════════════════════════════════════════
 
+// A config-fetch that failed or returned only a partial (list-view) object. Collected so a broken or
+// incomplete audit is visible instead of silently scoring like a clean one.
+export interface FetchError {
+  namespace: string;
+  objectType: ConfigObjectType | 'namespace';
+  objectName?: string;
+  message: string;
+  /** True when the scope's OWN list fetch failed (the whole scope is unaudited), vs a single object. */
+  fatal: boolean;
+}
+
 export interface AuditContext {
   tenant: string;
+  /** Namespaces whose top-level LB list fetch failed — excluded from scoring, surfaced as incomplete. */
+  fetchErrors: FetchError[];
   configs: {
     httpLoadBalancers: Map<string, unknown>;
     originPools: Map<string, unknown>;
@@ -105,6 +125,11 @@ export interface SecurityRule {
   // Short, customer-friendly expected value shown in checklist exports
   // (e.g. "Enabled", "Blocking", "TLS 1.2+"). Optional.
   expectedDisplay?: string;
+  // How much the config API can confirm this control. Defaults to 'auto'. When 'assisted'/'manual',
+  // the finding is flagged for human verification in the UI and exports (see verifyNote).
+  verify?: VerifyLevel;
+  // One-line reason the result needs a human eye (shown only when verify != 'auto').
+  verifyNote?: string;
   appliesTo: ConfigObjectType[];
   check: (object: unknown, context: AuditContext) => CheckResult;
   remediation: string;
@@ -129,6 +154,11 @@ export interface AuditFinding {
   loadBalancer: string;
   objectType: ConfigObjectType;
   objectName: string;
+  // Stable identity of the audited object (`namespace/objectType/objectName`) — lets scoring de-dup a
+  // shared sub-object (one WAF policy on N LBs) while the By-LB view keeps per-LB attribution.
+  objectKey: string;
+  verify: VerifyLevel;
+  verifyNote?: string;
   status: CheckStatus;
   message: string;
   currentValue?: unknown;
@@ -221,6 +251,11 @@ export interface AuditReport {
   durationMs: number;
   summary: AuditSummary;
   score: number;
+  // Number of findings that actually contributed to the weighted score (PASS/FAIL/WARN). When 0 the
+  // score is not meaningful → render N/A, not a red 0.
+  scoredCount: number;
+  // Config-fetch failures / incomplete scopes encountered during the run. Non-empty → audit is partial.
+  fetchErrors: FetchError[];
   findings: AuditFinding[];
   configSnapshot: ConfigSnapshot;
   entitlementSummary: EntitlementSummary;
@@ -239,6 +274,10 @@ export interface AuditOptions {
   ruleIds?: string[];
   minSeverity?: Severity;
   includePassedChecks?: boolean;
+  // LB-level scope. When set, only these load balancers (and their resolved sub-objects) are audited;
+  // tenant-wide and namespace-level checks still run at their true scope. Empty/undefined = all LBs in
+  // the selected namespaces.
+  loadBalancers?: Array<{ namespace: string; name: string }>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

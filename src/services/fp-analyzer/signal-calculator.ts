@@ -1,6 +1,7 @@
 import type { SignalScore, PathStats, QuickVerdict, ConfidenceLevel, SignatureSummary } from './types';
 import { scoreAiRisk, isStagedState, isAutoSuppressedState } from './ai-signals';
 import type { AiSignalInput } from './ai-signals';
+import { TP_BIAS_ATTACK_TYPES } from './attack-types';
 
 // ═══════════════════════════════════════════════════════════════
 // SIGNAL 1: USER BREADTH (weight 25%)
@@ -76,7 +77,14 @@ export function scoreContext(contextType: string, contextName: string): SignalSc
     if (cnLower === 'user-agent') {
       return { score: 30, rawValue: `header(${contextName})`, reason: 'User-Agent header — client-controlled, needs investigation' };
     }
-    if (/authorization|auth|token|x-/i.test(cnLower)) {
+    // Client/proxy-controllable forwarding headers — the client or an upstream proxy sets these, so
+    // a WAF hit here is user-controllable input (NOT app-generated auth, despite the "x-" prefix).
+    if (/^x-(forwarded|real-ip|requested-with|original|http-method|client)|^forwarded$|^referer$|^origin$/i.test(cnLower)) {
+      return { score: 35, rawValue: `header(${contextName})`, reason: `Header "${contextName}" — client/proxy-controllable, needs investigation` };
+    }
+    // App-generated auth/token/tracing headers — users don't control these (note: must be SPECIFIC
+    // x- headers, not any "x-" substring, which previously caught X-Forwarded-For etc.).
+    if (/authorization|^auth$|token|^x-(api-key|csrf|xsrf|amz|f5|envoy|b3|datadog|request-id)/i.test(cnLower)) {
       return { score: 85, rawValue: `header(${contextName})`, reason: `Header "${contextName}" — likely app-generated auth/token header` };
     }
     return { score: 60, rawValue: `header(${contextName})`, reason: `Header "${contextName}" — may be app-generated or user-controlled` };
@@ -243,15 +251,18 @@ export function scoreSignatureAccuracy(
   aiConfirmed: boolean,
   violationRatings: number[],
   aiInput?: AiSignalInput,
+  attackType?: string,
 ): SignalScore {
   let score = 50;
   const reasons: string[] = [];
+  let aiPos = 0; // FP-ward (positive) portion of the AI delta — the only part the TP-bias may cancel.
 
   // AI-WAF intelligence (req_risk, risk reasons, recommended_action). When the
   // structured AI input is available it supersedes the legacy aiConfirmed flag.
   if (aiInput) {
     const ai = scoreAiRisk(aiInput);
     score += ai.delta;
+    aiPos = Math.max(0, ai.delta);
     reasons.push(...ai.reasons);
   } else if (aiConfirmed) {
     score -= 40;
@@ -287,6 +298,18 @@ export function scoreSignatureAccuracy(
     } else if (avgRating <= 2) {
       score += 10;
       reasons.push(`Low violation rating (avg ${avgRating.toFixed(1)})`);
+    }
+  }
+
+  // Inherently-malicious attack types (recon / traversal / RCE / SSRF / injection) must not be dragged
+  // FP-ward by the AI's low-risk read. Cancel ONLY the AI-positive boost that was actually applied —
+  // never push below neutral on attack-type alone — so genuine FPs (whose FP-ness comes from breadth /
+  // origin signals) are untouched, and FP-prone families (absent from TP_BIAS) are unaffected.
+  if (attackType && TP_BIAS_ATTACK_TYPES.has(attackType)) {
+    const d = Math.min(25, aiPos);
+    if (d > 0) {
+      score -= d;
+      reasons.push(`${attackType} is inherently-malicious — discounting the AI low-risk FP boost`);
     }
   }
 

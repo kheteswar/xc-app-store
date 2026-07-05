@@ -17,12 +17,11 @@ import { runAdaptivePool } from '../src/services/fp-analyzer/adaptive-worker-poo
 import { computeFpSignals, EXPLOIT_PATH_RE } from '../src/services/fp-analyzer/fp-signals-v2';
 import { computeWafComparison } from '../src/services/fp-analyzer/waf-comparison';
 import { buildFpRecommendations } from '../src/services/fp-analyzer/recommendations';
-import { computeBotAnalysisFromAggregates, classifyBot } from '../src/services/fp-analyzer/bot-analysis';
+import { computeBotAnalysisFromAggregates, computeBotAggregatesFromEvents, classifyBot, botClassificationRaw } from '../src/services/fp-analyzer/bot-analysis';
 import type { BotAggregateInput } from '../src/services/fp-analyzer/bot-analysis';
-import type { BotAggBucket } from '../src/services/fp-analyzer/types';
 import {
-  emptyAiRiskCounts, tallyReqRisk, dominantRiskLevel, parseRiskReasons,
-  isStagedState, parseEnforcementMode, estimateActualCountFromRate,
+  emptyAiRiskCounts, tallyReqRisk, dominantRiskLevel, dominantRiskLabel, parseRiskReasons, parseReqRisk,
+  isStagedState, isAutoSuppressedState, parseEnforcementMode, estimateActualCountFromRate,
 } from '../src/services/fp-analyzer/ai-signals';
 import type { AiRiskCounts, AiSignalInput } from '../src/services/fp-analyzer/ai-signals';
 import { computeQuickVerdict, mapToRecord } from '../src/services/fp-analyzer/signal-calculator';
@@ -32,6 +31,8 @@ import {
   buildSignatureExclusionsWithRollup,
 } from '../src/services/fp-analyzer/exclusion-generator';
 import type { SigExclusionIntent } from '../src/services/fp-analyzer/exclusion-generator';
+import { computeEnforcementComparison } from '../src/services/fp-analyzer/enforcement-comparison';
+import type { ComparisonEvent, SignatureMeta, ViolationMeta } from '../src/services/fp-analyzer/enforcement-comparison';
 import { AnalysisLogger } from '../src/services/fp-analyzer/analysis-logger';
 import type {
   AnalysisScope, FPVerdict, IPBehaviorProfile, PathAnalysis,
@@ -49,13 +50,18 @@ const CHUNK_HOURS = 2;
 const PAGE_SIZE = 500;
 const JOB_EXPIRY_MS = 30 * 60 * 1000;
 const MAX_ENRICH_IPS = 500;       // cap: enrich the top-500 flagged IPs by event volume
-const IPS_PER_QUERY = 30;          // src_ip=~ regex batch size
+const IPS_PER_QUERY = 50;          // src_ip=~ regex batch size (more IPs/query = fewer enrichment round-trips)
 const BOT_AGG_TOPK = 500;          // distinct malicious src_ip buckets to request
+// Malicious bots are EXCLUDED from the main raw pull (server-side filter) — they're always req_risk
+// High true positives, so the comparison only needs their count (from total_hits). We pull a BOUNDED
+// raw sample purely for the breakdown detail (name/IPs/paths), so collection never bloats even when a
+// load balancer is heavily scanned. Field is `bot_info.classification` = "malicious" (lowercase).
+const MALICIOUS_BOT_SELECTOR = 'bot_info.classification=~"malicious"';
+const MALICIOUS_BOT_EXCLUDE = 'bot_info.classification!~"malicious"';
+const BOT_SAMPLE_CAP = 2000;       // max malicious-bot rows pulled for the breakdown sample
 // Server-side exclusion of malicious-bot rows from the WAF/violation pull. Substring
 // regex (`!~`) tolerates token variants (malicious / malicious_bot). Correctness is also
 // guaranteed by an always-on client-side drop, so this is purely a bandwidth optimization.
-const MALICIOUS_BOT_EXCLUDE = `bot_class!~"malicious"`;
-const MALICIOUS_BOT_MATCH = `bot_class=~"malicious"`;
 
 export interface ProgressiveJobConfig {
   tenant: string;
@@ -114,7 +120,9 @@ function normalizeEntries(rawEntries: unknown[]): RawEvent[] {
   return entries as RawEvent[];
 }
 
-function getStr(e: RawEvent, key: string): string { return (e[key] as string) || ''; }
+// Coerce to a string so equality checks (rsp_code === '200', '404') hold on tenants that emit
+// numeric values; (number) || '' would otherwise return the raw number, not a string.
+function getStr(e: RawEvent, key: string): string { const v = e[key]; return v == null ? '' : String(v); }
 function getNum(e: RawEvent, key: string): number {
   const v = e[key];
   if (typeof v === 'number') return v;
@@ -209,10 +217,15 @@ export class ProgressiveAnalysisJob {
   private ipEnrichCompleted = 0;
 
   // data
-  private allSecurityEvents: RawEvent[] = [];
+  private allSecurityEvents: RawEvent[] = [];      // malicious bots excluded (FP scoring / indexing)
+  private allSecurityEventsFull: RawEvent[] = [];  // WAF events EXCLUDING malicious bots (bots synthesized into the comparison from their count)
   private botAggregates: BotAggregateInput | null = null;
   private maliciousDroppedClientSide = 0;
   private serverBotFilterUsed = false;
+  private maliciousBotCount = 0;                   // full malicious-bot count (from total_hits — exact even when the detail sample is capped)
+  private maliciousBotEventsRaw: RawEvent[] = [];  // raw malicious-bot rows when the server filter is unavailable (client-drop fallback)
+  private botBreakdownSampled = false;             // true when the per-IP/path breakdown is from a capped sample, not all events
+  private botBreakdownSampleSize = 0;              // the sample size, for honest labelling in the report
   private secEventsBySignature = new Map<string, RawEvent[]>();
   private secEventsByViolation = new Map<string, RawEvent[]>();
   private flaggedIpEventCount = new Map<string, number>();
@@ -236,7 +249,7 @@ export class ProgressiveAnalysisJob {
     this.config = config;
     this.api = new NodeApiCaller({ tenant: config.tenant, token: config.token });
     this.logger = new AnalysisLogger();
-    this.controller = new AdaptiveConcurrencyController({ initialConcurrency: 3, minConcurrency: 1, maxConcurrency: 8, rampUpAfterSuccesses: 10 });
+    this.controller = new AdaptiveConcurrencyController({ initialConcurrency: 5, minConcurrency: 1, maxConcurrency: 12, rampUpAfterSuccesses: 6 });
   }
 
   isExpired(): boolean { return Date.now() - this.createdAt > JOB_EXPIRY_MS; }
@@ -318,29 +331,43 @@ export class ProgressiveAnalysisJob {
 
   private get vhName(): string { return `ves-io-http-loadbalancer-${this.config.lbName}`; }
 
+  // ── Phase 1: collect WAF events ──
+  // Fetch WAF events with malicious bots EXCLUDED at the source (server-side filter, when supported)
+  // so the raw download stays small. Malicious bots are always req_risk High true positives, so the
+  // Traditional-vs-AI comparison reconstructs them from their exact count (total_hits); their breakdown
+  // detail comes from a separate bounded sample. See probeBotFilter / synthesizeMaliciousBotEvents.
   /**
-   * Probe whether the API accepts the malicious-bot exclusion filter on this tenant.
-   * If the field/operator is unsupported the call errors → we fall back to a client-side
-   * drop (correct, just no bandwidth saving). A success means we can exclude server-side.
+   * Probe whether the API actually filters on `bot_info.classification`, so we can exclude malicious
+   * bots at the SOURCE. We don't trust "no error" — a silently-ignored filter returns everything — so
+   * we VERIFY by comparing total_hits: the exclude filter must return strictly fewer rows than the
+   * unfiltered query. The difference is the exact malicious-bot count (kept even when the later detail
+   * sample is capped).
    */
-  private async probeServerBotFilter(): Promise<boolean> {
-    const q = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_EXCLUDE}}`;
+  private async probeBotFilter(baseSelector: string): Promise<void> {
+    this.serverBotFilterUsed = false;
+    this.maliciousBotCount = 0;
     try {
-      await this.api.fetchSecurityEventsPage(this.config.namespace, q, this.startTime, this.endTime, 1);
-      return true;
+      const [all, nonBot] = await Promise.all([
+        this.api.fetchSecurityEventsPage(this.config.namespace, `{${baseSelector}}`, this.startTime, this.endTime, 1),
+        this.api.fetchSecurityEventsPage(this.config.namespace, `{${baseSelector}, ${MALICIOUS_BOT_EXCLUDE}}`, this.startTime, this.endTime, 1),
+      ]);
+      const tAll = parseTotalHits(all.total_hits);
+      const tNon = parseTotalHits(nonBot.total_hits);
+      if (tAll > 0 && tNon < tAll) {        // filter discriminates → usable; difference = malicious count
+        this.serverBotFilterUsed = true;
+        this.maliciousBotCount = tAll - tNon;
+      }
+      console.log(`[FP ${this.id}] BOT FILTER PROBE: total=${tAll}, non-malicious=${tNon} → serverFilter=${this.serverBotFilterUsed}, malicious=${this.maliciousBotCount}`);
     } catch (e) {
-      console.warn(`[FP ${this.id}] server-side bot_class filter unsupported — using client-side drop. (${e instanceof Error ? e.message : String(e)})`);
-      return false;
+      console.log(`[FP ${this.id}] BOT FILTER PROBE failed (${e instanceof Error ? e.message : String(e)}) — will pull all + drop client-side`);
     }
   }
 
-  // ── Phase 1: collect WAF events (malicious bots excluded) ──
   private async collectWafEvents(): Promise<RawEvent[]> {
-    const useServerFilter = await this.probeServerBotFilter();
-    this.serverBotFilterUsed = useServerFilter;
-    const query = useServerFilter
-      ? `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_EXCLUDE}}`
-      : `{vh_name="${this.vhName}", sec_event_name="WAF"}`;
+    const baseSelector = `vh_name="${this.vhName}", sec_event_name="WAF"`;
+    await this.probeBotFilter(baseSelector);
+    // Exclude malicious bots at the source when the filter is supported — keeps the raw download small.
+    const query = this.serverBotFilterUsed ? `{${baseSelector}, ${MALICIOUS_BOT_EXCLUDE}}` : `{${baseSelector}}`;
     const chunks = splitIntoChunks(this.startTime, this.endTime, CHUNK_HOURS);
     this.totalChunks = chunks.length;
     this.chunksCompleted = 0;
@@ -385,55 +412,136 @@ export class ProgressiveAnalysisJob {
 
     const expectedVh = this.vhName;
     const scoped = allEvents.filter(e => { const vh = getStr(e, 'vh_name'); return !vh || vh === expectedVh; }).filter(isWafEvent);
-    // Always-on safety net: drop Malicious-classified rows even if the server-side filter
-    // was absent or silently ignored, so they never pollute FP scoring. No-op when the
-    // server already excluded them.
-    const filtered = scoped.filter(e => classifyBot((e.bot_info as Record<string, unknown> | undefined)?.classification) !== 'malicious');
-    this.maliciousDroppedClientSide = scoped.length - filtered.length;
-    if (this.maliciousDroppedClientSide > 0) console.log(`[FP ${this.id}] dropped ${this.maliciousDroppedClientSide} malicious-bot events client-side (serverFilter=${this.serverBotFilterUsed})`);
-    this.securityEventsCollected = filtered.length;
+    // Malicious bots are EXCLUDED from the analysed/comparison set: they're always req_risk High true
+    // positives (no FP scoring needed) and the comparison reconstructs them from their count. When the
+    // server filter was unavailable, the bots are still in `scoped` here, so drop them client-side and
+    // keep the raw rows for the breakdown detail.
+    const nonBot = scoped.filter(e => classifyBot(botClassificationRaw(e)) !== 'malicious');
+    if (!this.serverBotFilterUsed) {
+      this.maliciousBotEventsRaw = scoped.filter(e => classifyBot(botClassificationRaw(e)) === 'malicious');
+      this.maliciousBotCount = this.maliciousBotEventsRaw.length;
+    }
+    this.maliciousDroppedClientSide = scoped.length - nonBot.length;
+    this.allSecurityEventsFull = nonBot;
+    console.log(`[FP ${this.id}] WAF pull: ${nonBot.length} non-bot events (serverFilter=${this.serverBotFilterUsed}, malicious bots excluded=${this.maliciousBotCount}, droppedClientSide=${this.maliciousDroppedClientSide})`);
+    this.securityEventsCollected = nonBot.length;
     this.securityEventsExpected = expectedHits;
     this.dataPartial = !this.cancelled && ((this.totalChunks - this.chunksCompleted) > 0 || anyScrollBroke);
     if (this.dataPartial) console.warn(`[FP ${this.id}] PARTIAL: ${this.totalChunks - this.chunksCompleted} chunk(s) failed, scrollBroke=${anyScrollBroke}`);
-    return filtered;
+    return nonBot;
   }
 
-  /** One terms aggregation over the security events; returns sorted buckets (or [] on error). */
-  private async aggField(query: string, field: string, topk: number): Promise<BotAggBucket[]> {
-    const key = `${field.replace(/\./g, '_')}_agg`;
+  /**
+   * Bot-classification track. Malicious bots are EXCLUDED from the main raw pull (so collection stays
+   * fast even when an LB is hit by 1M+ scanner requests). So:
+   *  • COUNT is the exact total_hits figure (from the probe) — never the sample.
+   *  • Per-IP / per-path / per-country breakdowns come from server-side AGGREGATION over ALL malicious
+   *    events (accurate top-N with true counts — the old raw sample was the first 2k rows and missed
+   *    the heaviest IPs).
+   *  • Nested bot_info.* fields (name/type) that the aggregation API may not support fall back to a
+   *    small raw sample.
+   * The classification distribution = exact malicious total + the non-malicious bots from the main pull.
+   */
+  private async collectMaliciousBotAggregates(): Promise<void> {
+    const malQuery = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_SELECTOR}}`;
+    const empty: Array<{ key: string; count: number }> = [];
+    const [aggIp, aggPath, aggCountry, aggAsOrg, aggAction, aggReqRisk, aggReco, aggUa, aggName, aggType, aggDetect] =
+      this.maliciousBotCount > 0
+        ? await Promise.all([
+            this.aggField(malQuery, 'src_ip', BOT_AGG_TOPK),
+            this.aggField(malQuery, 'req_path', 100),
+            this.aggField(malQuery, 'country', 50),
+            this.aggField(malQuery, 'as_org', 50),
+            this.aggField(malQuery, 'action', 20),
+            this.aggField(malQuery, 'req_risk', 10),
+            this.aggField(malQuery, 'recommended_action', 20),
+            this.aggField(malQuery, 'user_agent', 50),
+            this.aggField(malQuery, 'bot_info.name', 50),
+            this.aggField(malQuery, 'bot_info.type', 20),
+            this.aggField(malQuery, 'risk_score_info.source', 20),
+          ])
+        : [empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty];
+
+    // Sample fallback: only when aggregation didn't cover the data (no IP buckets, or nested name/type
+    // unsupported). In client-drop mode we already hold the raw rows; otherwise pull a bounded sample.
+    const aggWorked = aggIp.length > 0;
+    let sample = this.maliciousBotEventsRaw;
+    if (this.maliciousBotCount > 0 && sample.length === 0 && (!aggWorked || aggName.length === 0)) {
+      sample = await this.pullMaliciousBotSample();
+    }
+    if (this.maliciousBotCount === 0) this.maliciousBotCount = sample.length;
+    const s = computeBotAggregatesFromEvents(sample, BOT_AGG_TOPK);
+    const pick = (a: Array<{ key: string; count: number }>, b: Array<{ key: string; count: number }> | undefined) => (a.length > 0 ? a : (b ?? []));
+
+    // Classification distribution: EXACT malicious total + non-malicious classes from the main pull.
+    const nonMal = new Map<string, number>();
+    for (const e of this.allSecurityEventsFull) {
+      const raw = botClassificationRaw(e) || '(unclassified)';
+      if (classifyBot(raw) === 'malicious') continue;
+      nonMal.set(raw, (nonMal.get(raw) || 0) + 1);
+    }
+    const classDistribution = [{ key: 'Malicious', count: this.maliciousBotCount }, ...[...nonMal].map(([key, count]) => ({ key, count }))]
+      .filter(b => b.count > 0);
+
+    this.botAggregates = {
+      classDistribution,
+      byIp: pick(aggIp, s.byIp),
+      byBotName: pick(aggName, s.byBotName),
+      byBotType: pick(aggType, s.byBotType),
+      byDetection: pick(aggDetect, s.byDetection),
+      byUserAgent: pick(aggUa, s.byUserAgent),
+      byCountry: pick(aggCountry, s.byCountry),
+      byAsOrg: pick(aggAsOrg, s.byAsOrg),
+      byReqRisk: pick(aggReqRisk, s.byReqRisk),
+      byAction: pick(aggAction, s.byAction),
+      byRecommendation: pick(aggReco, s.byRecommendation),
+      byPath: pick(aggPath, s.byPath),
+      ipTopk: BOT_AGG_TOPK,
+    };
+    // Honest labelling: when aggregation was unavailable AND the exact count exceeds the sample we pulled,
+    // the per-IP/path breakdown is a SAMPLE — the report must say so (distinct-client count is a floor).
+    this.botBreakdownSampled = !aggWorked && this.maliciousBotCount > sample.length;
+    this.botBreakdownSampleSize = sample.length;
+    console.log(`[FP ${this.id}] BOT SCAN: malicious=${this.maliciousBotCount} (exact), breakdown source=${aggWorked ? 'aggregation' : 'sample'}${this.botBreakdownSampled ? ` (SAMPLED — breakdown from ${sample.length} of ${this.maliciousBotCount})` : ''}, distinct top IPs=${this.botAggregates.byIp.length}, sampleRows=${sample.length}`);
+  }
+
+  /** One server-side terms aggregation over the malicious-bot query — accurate top-N with true counts
+   *  across ALL events. Returns [] when the field is unsupported (some nested bot_info.*), so callers
+   *  fall back to the raw sample. Parses the common F5 bucket shapes defensively. */
+  private async aggField(query: string, field: string, topk: number): Promise<Array<{ key: string; count: number }>> {
     try {
-      const resp = await this.api.fetchSecurityEventsAggregation(this.config.namespace, query, this.startTime, this.endTime, { [key]: { field, topk } });
-      const bucket = (resp.aggs as Record<string, unknown> | undefined)?.[key] as { buckets?: unknown[] } | undefined;
-      const out: BotAggBucket[] = [];
-      for (const b of bucket?.buckets ?? []) {
-        const o = b as Record<string, unknown>;
-        const k = o.key ?? o.value ?? '';
-        const count = Number(o.count ?? o.doc_count ?? 0);
-        if (k !== '' && k != null) out.push({ key: String(k), count });
-      }
-      return out.sort((a, b) => b.count - a.count);
-    } catch (e) {
-      console.warn(`[FP ${this.id}] agg ${field} failed: ${e instanceof Error ? e.message : String(e)}`);
+      const res = await this.api.fetchSecurityEventsAggregation(this.config.namespace, query, this.startTime, this.endTime, { a: { field, topk } });
+      const node = (res.aggs as Record<string, unknown> | undefined)?.a as { buckets?: unknown } | undefined;
+      const buckets = Array.isArray(node?.buckets) ? (node!.buckets as Array<Record<string, unknown>>) : [];
+      return buckets
+        .map(b => ({ key: String(b.key ?? b.value ?? ''), count: Number(b.count ?? b.doc_count ?? (b as { value?: number }).value ?? 0) }))
+        .filter(b => b.key && b.count > 0);
+    } catch {
       return [];
     }
   }
 
-  /**
-   * Bot-classification track — SERVER-SIDE AGGREGATION ONLY (no raw malicious rows).
-   * One distribution agg over all WAF events for the classification counts, plus
-   * Malicious-only terms aggs (src_ip / bot_name / user_agent / country).
-   */
-  private async collectMaliciousBotAggregates(): Promise<void> {
-    const allWaf = `{vh_name="${this.vhName}", sec_event_name="WAF"}`;
-    const malicious = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_MATCH}}`;
-    const [classDistribution, byIp, byBotName, byUserAgent, byCountry] = await Promise.all([
-      this.aggField(allWaf, 'bot_class', 16),
-      this.aggField(malicious, 'src_ip', BOT_AGG_TOPK),
-      this.aggField(malicious, 'bot_name', 50),
-      this.aggField(malicious, 'user_agent', 50),
-      this.aggField(malicious, 'country', 30),
-    ]);
-    this.botAggregates = { classDistribution, byIp, byBotName, byUserAgent, byCountry, ipTopk: BOT_AGG_TOPK };
+  /** Bounded raw pull of malicious-bot rows for the breakdown detail only (capped so a scanned LB
+   *  can't bloat collection). The exact count already came from total_hits in the probe. */
+  private async pullMaliciousBotSample(): Promise<RawEvent[]> {
+    const query = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_SELECTOR}}`;
+    const out: RawEvent[] = [];
+    try {
+      const initial = await this.api.fetchSecurityEventsPage(this.config.namespace, query, this.startTime, this.endTime, PAGE_SIZE);
+      if (initial.events) out.push(...normalizeEntries(initial.events));
+      let scrollId = initial.scroll_id;
+      while (scrollId && out.length < BOT_SAMPLE_CAP) {
+        try {
+          const page = await this.api.scrollSecurityEvents(this.config.namespace, scrollId);
+          if (!page.events || page.events.length === 0) break;
+          out.push(...normalizeEntries(page.events));
+          scrollId = page.scroll_id;
+        } catch { break; }
+      }
+    } catch (e) {
+      console.warn(`[FP ${this.id}] malicious-bot detail sample failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return out.slice(0, BOT_SAMPLE_CAP);
   }
 
   // ── Phase 2: index + collect flagged IPs + distinct paths ──
@@ -493,7 +601,7 @@ export class ProgressiveAnalysisJob {
     for (const ip of ips) acc.set(ip, { rspCodes: new Map(), paths: new Set(), ua: new Map(), total: 0, srSum: 0, srCount: 0, country: '', asOrg: '', timestamps: [] });
 
     const chunks = splitIntoChunks(this.startTime, this.endTime, CHUNK_HOURS);
-    const controller = new AdaptiveConcurrencyController({ initialConcurrency: 3, minConcurrency: 1, maxConcurrency: 10, rampUpAfterSuccesses: 10 });
+    const controller = new AdaptiveConcurrencyController({ initialConcurrency: 6, minConcurrency: 1, maxConcurrency: 16, rampUpAfterSuccesses: 5 });
 
     const batches: string[][] = [];
     for (let i = 0; i < ips.length; i += IPS_PER_QUERY) batches.push(ips.slice(i, i + IPS_PER_QUERY));
@@ -588,7 +696,7 @@ export class ProgressiveAnalysisJob {
     for (const p of paths) acc.set(p, { users: new Set(), total: 0, srSum: 0, srCount: 0 });
 
     const chunks = splitIntoChunks(this.startTime, this.endTime, CHUNK_HOURS);
-    const controller = new AdaptiveConcurrencyController({ initialConcurrency: 3, minConcurrency: 1, maxConcurrency: 8, rampUpAfterSuccesses: 10 });
+    const controller = new AdaptiveConcurrencyController({ initialConcurrency: 6, minConcurrency: 1, maxConcurrency: 16, rampUpAfterSuccesses: 5 });
     const PATHS_PER_QUERY = 20;
     const batches: string[][] = [];
     for (let i = 0; i < paths.length; i += PATHS_PER_QUERY) batches.push(paths.slice(i, i + PATHS_PER_QUERY));
@@ -665,7 +773,7 @@ export class ProgressiveAnalysisJob {
       const rc = getStr(e, 'rsp_code') || '0'; rspCodes.set(rc, (rspCodes.get(rc) || 0) + 1);
       const ua = getStr(e, 'user_agent') || getStr(e, 'browser_type') || 'unknown'; userAgents.set(ua, (userAgents.get(ua) || 0) + 1);
       const c = getStr(e, 'country') || 'unknown'; countries.set(c, (countries.get(c) || 0) + 1);
-      const bc = classifyBot((e.bot_info as Record<string, unknown> | undefined)?.classification); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
+      const bc = classifyBot(botClassificationRaw(e)); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
       if (getStr(e, 'action') === 'block') block++; else report++;
       const vr = getNum(e, 'violation_rating'); if (vr > 0) violationRatings.push(vr);
       tallyReqRisk(aiRiskCounts, e.req_risk);
@@ -673,9 +781,18 @@ export class ProgressiveAnalysisJob {
       const rr = e.req_risk_reasons; if (Array.isArray(rr)) riskReasons.push(...rr.map(String)); else if (rr) riskReasons.push(String(rr));
       const sig = getSignatures(e).find(s => s.id === sigId);
       if (sig) {
-        if (!name) { name = sig.name; accuracy = sig.accuracy; attackType = sig.attackType; const ctx = normalizeSigContext(sig); contextType = ctx.contextType; contextName = ctx.contextName; contextRaw = sig.context; sigState = sig.state; }
-        if (sig.state === 'AutoSuppressed') autoSuppressed = true;
+        if (!name) { name = sig.name; accuracy = sig.accuracy; attackType = sig.attackType; const ctx = normalizeSigContext(sig); contextType = ctx.contextType; contextName = ctx.contextName; contextRaw = sig.context; }
+        // Detect F5 state via the canonical helpers (case/separator/whitespace tolerant —
+        // F5 emits "AutoSuppressed", but also variants like "Auto-Suppressed"/"auto_suppressed").
+        // A brittle `=== 'AutoSuppressed'` here disagreed with the scorer (which uses the regex),
+        // leaving the signature flagged FP by the score yet missing from the auto-handled list.
+        if (isAutoSuppressedState(sig.state)) autoSuppressed = true;
         if (isStagedState(sig.state)) staged = true;
+        // Representative state for display (FPAnalyzer UI) + scorer input (drives the
+        // F5_CONFIRMED_FP override). State is normally constant per signature; if events
+        // disagree or the first is empty, let a non-empty suppressed/staged value win so
+        // sigState stays consistent with the flags above.
+        if (sig.state && (!sigState || isAutoSuppressedState(sig.state) || isStagedState(sig.state))) sigState = sig.state;
         if (sig.matchingInfo && matchingInfos.length < 20) matchingInfos.push(sig.matchingInfo);
       }
     }
@@ -704,6 +821,9 @@ export class ProgressiveAnalysisJob {
   private buildSummary(): SummaryResult {
     const signatures: SignatureSummary[] = [];
     const violations: ViolationSummary[] = [];
+    // Per-signature / per-violation metadata + enriched verdict, fed to the blocking-mode comparison engine.
+    const sigMeta = new Map<string, SignatureMeta>();
+    const violMeta = new Map<string, ViolationMeta>();
 
     if (this.config.scopes.includes('waf_signatures')) {
       for (const [sigId, events] of this.secEventsBySignature) {
@@ -714,7 +834,7 @@ export class ProgressiveAnalysisJob {
           pathCount: a.pathCounts.size, totalAppPaths: this.totalDistinctPaths || a.pathCounts.size, pathTotalUsers: this.topPathUsers(a.pathCounts),
           contextType: a.contextType, contextName: a.contextName,
           sampleMatchingInfos: a.matchingInfos, rspCodes: mapToRecord(a.rspCodes), ipProfiles,
-          accuracy: a.accuracy, sigState: a.sigState, aiConfirmed: a.reasonVerdict.aiConfirmedAttack,
+          accuracy: a.accuracy, sigState: a.sigState, aiConfirmed: a.reasonVerdict.aiConfirmedAttack, attackType: a.attackType, eventCount: events.length,
           violationRatings: a.violationRatings, aiInput: aiInputFrom(a.aiRiskCounts, a.riskReasons, a.recommendedAction),
           botClassifications: mapToRecord(a.botClassifications),
         });
@@ -722,13 +842,18 @@ export class ProgressiveAnalysisJob {
         const entry: SignatureSummary = {
           sigId, name: a.name, accuracy: a.accuracy, attackType: a.attackType,
           totalEvents: events.length, uniqueUsers: a.uniqueUsers.size, uniquePaths: a.pathCounts.size, uniqueIPs: a.uniqueIPs.size,
-          topPaths, autoSuppressed: a.autoSuppressed, aiRisk: dominantRiskLevel(a.aiRiskCounts),
+          topPaths, autoSuppressed: a.autoSuppressed, aiRisk: dominantRiskLabel(a.aiRiskCounts),
           recommendedAction: a.recommendedAction || undefined, staged: a.staged || undefined,
           actions: { block: a.block, report: a.report }, quickVerdict: 'investigate', quickConfidence: 'low',
           fpScore: signals.compositeScore, fpVerdict: signals.verdict,
         };
         const qv = computeQuickVerdict(entry); entry.quickVerdict = qv.verdict; entry.quickConfidence = qv.confidence;
         signatures.push(entry);
+        sigMeta.set(sigId, {
+          sigId, name: a.name, verdict: entry.fpVerdict, attackType: a.attackType,
+          contextType: a.contextType, contextName: a.contextName,
+          path: topPaths[0]?.path || '/', methods: [...a.methods.keys()],
+        });
       }
       const pri: Record<string, number> = { highly_likely_fp: 0, likely_fp: 1, ambiguous: 2, likely_tp: 3, confirmed_tp: 4 };
       signatures.sort((x, y) => (pri[x.fpVerdict] - pri[y.fpVerdict]) || (y.fpScore - x.fpScore) || (y.totalEvents - x.totalEvents));
@@ -746,7 +871,7 @@ export class ProgressiveAnalysisJob {
           const ip = getStr(e, 'src_ip'); uniqueUsers.add(getStr(e, 'user') || ip); if (ip) uniqueIPs.add(ip);
           pathCounts.set(getStr(e, 'req_path') || '/', (pathCounts.get(getStr(e, 'req_path') || '/') || 0) + 1);
           const rc = getStr(e, 'rsp_code') || '0'; rspCodes.set(rc, (rspCodes.get(rc) || 0) + 1);
-          const bc = classifyBot((e.bot_info as Record<string, unknown> | undefined)?.classification); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
+          const bc = classifyBot(botClassificationRaw(e)); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
           tallyReqRisk(aiRiskCounts, e.req_risk);
           const ra = getStr(e, 'recommended_action'); if (ra) recommendedActions.set(ra, (recommendedActions.get(ra) || 0) + 1);
           const rr = e.req_risk_reasons; if (Array.isArray(rr)) riskReasons.push(...rr.map(String)); else if (rr) riskReasons.push(String(rr));
@@ -758,30 +883,79 @@ export class ProgressiveAnalysisJob {
           totalAppPaths: this.totalDistinctPaths || pathCounts.size, pathTotalUsers: this.topPathUsers(pathCounts), contextType: 'violation', contextName: violName,
           sampleMatchingInfos: matchingInfos, rspCodes: mapToRecord(rspCodes), ipProfiles,
           accuracy: 'medium_accuracy', sigState: 'Enabled', aiConfirmed: parseRiskReasons(riskReasons).aiConfirmedAttack,
-          violationRatings: [], aiInput: aiInputFrom(aiRiskCounts, riskReasons, dominantAction(recommendedActions)), violationName: violName,
+          violationRatings: [], aiInput: aiInputFrom(aiRiskCounts, riskReasons, dominantAction(recommendedActions)), violationName: violName, attackType, eventCount: events.length,
           botClassifications: mapToRecord(botClassifications),
         });
         const topPaths = [...pathCounts.entries()].sort((x, y) => y[1] - x[1]).slice(0, 3).map(([path, count]) => ({ path, count }));
         violations.push({
           violationName: violName, attackType, totalEvents: events.length, uniqueUsers: uniqueUsers.size, uniquePaths: pathCounts.size,
-          topPaths, aiRisk: dominantRiskLevel(aiRiskCounts), quickVerdict: 'investigate', quickConfidence: 'low',
+          topPaths, aiRisk: dominantRiskLabel(aiRiskCounts), quickVerdict: 'investigate', quickConfidence: 'low',
           fpScore: signals.compositeScore, fpVerdict: signals.verdict,
         });
+        // Violations don't carry per-method aggregation here; the engine defaults methods for the exclusion intent.
+        violMeta.set(violName, { name: violName, verdict: signals.verdict, path: topPaths[0]?.path || '/', methods: [] });
       }
       const pri: Record<string, number> = { highly_likely_fp: 0, likely_fp: 1, ambiguous: 2, likely_tp: 3, confirmed_tp: 4 };
       violations.sort((x, y) => (pri[x.fpVerdict] - pri[y.fpVerdict]) || (y.fpScore - x.fpScore));
     }
 
     const enforcement = parseEnforcementMode(this.enforcementMode);
-    const wafComparison = computeWafComparison(this.allSecurityEvents, enforcement);
+    // Malicious bots are excluded from the raw set (to keep the pull small) but ARE part of the
+    // comparison: every one is a req_risk High true positive, so reconstruct them from the exact count.
+    const botRequests = this.synthesizeMaliciousBotEvents();
+    const wafComparison = computeWafComparison([...this.allSecurityEventsFull, ...botRequests], enforcement);
     const botAnalysis = this.botAggregates ? computeBotAnalysisFromAggregates(this.botAggregates) : undefined;
+    if (botAnalysis) {
+      botAnalysis.maliciousEvents = this.maliciousBotCount; // exact total_hits count (the detail sample may be capped)
+      botAnalysis.breakdownSampled = this.botBreakdownSampled;
+      botAnalysis.breakdownSampleSize = this.botBreakdownSampleSize;
+    }
     const recommendations = buildFpRecommendations({ signatures, violations, comparison: wafComparison, enforcementMode: enforcement, botAnalysis });
+
+    // Blocking-mode comparison: simulate legacy-accuracy vs AI-risk policies over the pulled
+    // events (signatures + violations) and weigh each policy's exclusion-rule overhead.
+    const enforcementComparison = (sigMeta.size > 0 || violMeta.size > 0)
+      ? computeEnforcementComparison(this.buildComparisonEvents(violMeta.size > 0), sigMeta, violMeta)
+      : undefined;
+
     return {
       signatures, violations, threatMeshIPs: [], policyRules: [],
       totalEvents: this.securityEventsCollected, period: { start: this.startTime, end: this.endTime },
       enforcementMode: enforcement, avgSampleRate: 1, dataPartial: this.dataPartial || undefined,
-      wafComparison, recommendations, botAnalysis,
+      wafComparison, recommendations, botAnalysis, enforcementComparison,
     };
+  }
+
+  /**
+   * Reduce the raw pulled events to the minimal shape the blocking-mode comparison reads.
+   * Violations are included only when the violations scope was analyzed (so we have verdicts
+   * for them); otherwise they are omitted to keep signature-only analysis unchanged.
+   */
+  private buildComparisonEvents(includeViolations: boolean): ComparisonEvent[] {
+    const out: ComparisonEvent[] = [];
+    for (const e of this.allSecurityEventsFull) {
+      const sigs = getSignatures(e);
+      const viols = includeViolations ? getViolations(e) : [];
+      if (sigs.length === 0 && viols.length === 0) continue;
+      out.push({
+        reqRisk: getStr(e, 'req_risk'),
+        signatures: sigs.map(s => ({ id: s.id, accuracy: s.accuracy, state: s.state })),
+        violations: viols.map(v => ({ name: v.name, state: v.state })),
+      });
+    }
+    // Malicious bots are excluded from the raw set — reconstruct them: each is a req_risk High true
+    // positive blocked by the traditional WAF (Bot Defense) and by the AI risk score.
+    const botEvent: ComparisonEvent = { reqRisk: 'high', signatures: [], violations: [], maliciousBot: true };
+    for (let i = 0; i < this.maliciousBotCount; i++) out.push(botEvent);
+    return out;
+  }
+
+  /** Reconstruct the malicious-bot requests (excluded from the raw pull) for the WAF comparison: each
+   *  is a req_risk High true positive flagged as a malicious bot. One shared read-only prototype. */
+  private synthesizeMaliciousBotEvents(): RawEvent[] {
+    if (this.maliciousBotCount <= 0) return [];
+    const proto = { req_risk: 'high', 'bot_info.classification': 'malicious', rsp_code: '404' } as unknown as RawEvent;
+    return new Array(this.maliciousBotCount).fill(proto);
   }
 
   // ── On-demand signature detail ──
@@ -795,7 +969,7 @@ export class ProgressiveAnalysisJob {
       distinctIPs: a.uniqueIPs.size, distinctUsers: a.uniqueUsers.size, pathCount: a.pathCounts.size,
       totalAppPaths: this.totalDistinctPaths || a.pathCounts.size, pathTotalUsers: this.topPathUsers(a.pathCounts), contextType: a.contextType, contextName: a.contextName,
       sampleMatchingInfos: a.matchingInfos, rspCodes: mapToRecord(a.rspCodes), ipProfiles,
-      accuracy: a.accuracy, sigState: a.sigState, aiConfirmed: a.reasonVerdict.aiConfirmedAttack,
+      accuracy: a.accuracy, sigState: a.sigState, aiConfirmed: a.reasonVerdict.aiConfirmedAttack, attackType: a.attackType, eventCount: events.length,
       violationRatings: a.violationRatings, aiInput: aiInputFrom(a.aiRiskCounts, a.riskReasons, a.recommendedAction),
       botClassifications: mapToRecord(a.botClassifications),
     });
@@ -840,14 +1014,14 @@ export class ProgressiveAnalysisJob {
         uas.set(getStr(e, 'user_agent') || 'unknown', 1); countries.set(getStr(e, 'country') || 'unknown', 1);
         methods.set(getStr(e, 'method') || 'GET', (methods.get(getStr(e, 'method') || 'GET') || 0) + 1);
         const rc = getStr(e, 'rsp_code') || '0'; rsp.set(rc, (rsp.get(rc) || 0) + 1);
-        const bc = classifyBot((e.bot_info as Record<string, unknown> | undefined)?.classification); bots.set(bc, (bots.get(bc) || 0) + 1);
+        const bc = classifyBot(botClassificationRaw(e)); bots.set(bc, (bots.get(bc) || 0) + 1);
         const sig = getSignatures(e).find(s => s.id === sigId); if (sig?.matchingInfo && mi.length < 5) mi.push(sig.matchingInfo);
       }
       const signals = computeFpSignals({
         distinctIPs: ips.size, distinctUsers: users.size, pathCount: 1, totalAppPaths: this.totalDistinctPaths || 1, pathTotalUsers: this.pathBehavior.get(path)?.totalUsers,
         contextType: agg.contextType, contextName: agg.contextName, sampleMatchingInfos: mi, rspCodes: mapToRecord(rsp),
         ipProfiles: this.ipProfilesFor(ips), accuracy: agg.accuracy, sigState: agg.sigState,
-        aiConfirmed: agg.reasonVerdict.aiConfirmedAttack, violationRatings: [],
+        aiConfirmed: agg.reasonVerdict.aiConfirmedAttack, violationRatings: [], attackType: agg.attackType,
         aiInput: aiInputFrom(agg.aiRiskCounts, agg.riskReasons, agg.recommendedAction),
         botClassifications: mapToRecord(bots),
       });
@@ -875,7 +1049,7 @@ export class ProgressiveAnalysisJob {
       countries.set(getStr(e, 'country') || 'unknown', (countries.get(getStr(e, 'country') || 'unknown') || 0) + 1);
       methods.set(getStr(e, 'method') || 'GET', (methods.get(getStr(e, 'method') || 'GET') || 0) + 1);
       rspCodes.set(getStr(e, 'rsp_code') || '0', (rspCodes.get(getStr(e, 'rsp_code') || '0') || 0) + 1);
-      const bc = classifyBot((e.bot_info as Record<string, unknown> | undefined)?.classification); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
+      const bc = classifyBot(botClassificationRaw(e)); botClassifications.set(bc, (botClassifications.get(bc) || 0) + 1);
       tallyReqRisk(aiRiskCounts, e.req_risk);
       const ra = getStr(e, 'recommended_action'); if (ra) recommendedActions.set(ra, (recommendedActions.get(ra) || 0) + 1);
       const rr = e.req_risk_reasons; if (Array.isArray(rr)) riskReasons.push(...rr.map(String)); else if (rr) riskReasons.push(String(rr));
@@ -887,7 +1061,7 @@ export class ProgressiveAnalysisJob {
       totalAppPaths: this.totalDistinctPaths || pathCounts.size, pathTotalUsers: this.topPathUsers(pathCounts), contextType: 'violation', contextName: violName,
       sampleMatchingInfos: matchingInfos, rspCodes: mapToRecord(rspCodes), ipProfiles,
       accuracy: 'medium_accuracy', sigState: 'Enabled', aiConfirmed: parseRiskReasons(riskReasons).aiConfirmedAttack,
-      violationRatings: [], aiInput: aiInputFrom(aiRiskCounts, riskReasons, dominantAction(recommendedActions)), violationName: violName,
+      violationRatings: [], aiInput: aiInputFrom(aiRiskCounts, riskReasons, dominantAction(recommendedActions)), violationName: violName, attackType, eventCount: events.length,
       botClassifications: mapToRecord(botClassifications),
     });
     const rawPaths = [...pathCounts.entries()].sort((x, y) => y[1] - x[1]).map(([p]) => p);

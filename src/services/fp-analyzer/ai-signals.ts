@@ -26,10 +26,13 @@ export interface AiRiskCounts {
   medium: number;
   low: number;
   unknown: number;
+  /** Of the `low` events, how many were the AI's EXPLICIT "false positive" verdict (vs plain low risk).
+   *  Lets a label distinguish "false positive" from "low" without changing the level math. */
+  falsePositive: number;
 }
 
 export function emptyAiRiskCounts(): AiRiskCounts {
-  return { high: 0, medium: 0, low: 0, unknown: 0 };
+  return { high: 0, medium: 0, low: 0, unknown: 0, falsePositive: 0 };
 }
 
 /**
@@ -66,6 +69,7 @@ export function parseReqRisk(raw: unknown): AiRiskLevel {
 
 export function tallyReqRisk(counts: AiRiskCounts, raw: unknown): void {
   counts[parseReqRisk(raw)]++;
+  if (/false[\s_-]*positive/i.test(String(raw ?? ''))) counts.falsePositive++;
 }
 
 /** The level with the most events (ignoring 'unknown'); 'unknown' if no signal. */
@@ -75,6 +79,14 @@ export function dominantRiskLevel(counts: AiRiskCounts): AiRiskLevel {
   if (counts.high >= counts.medium && counts.high >= counts.low) return 'high';
   if (counts.low >= counts.medium && counts.low >= counts.high) return 'low';
   return 'medium';
+}
+
+/** Like dominantRiskLevel, but reports the explicit "false positive" verdict (the AI's own FP call)
+ *  rather than the generic "low" level when the benign events are predominantly false positives. */
+export function dominantRiskLabel(counts: AiRiskCounts): AiRiskLevel | 'false positive' {
+  const level = dominantRiskLevel(counts);
+  if (level === 'low' && counts.falsePositive > counts.low - counts.falsePositive) return 'false positive';
+  return level;
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -88,16 +100,26 @@ export interface RiskReasonVerdict {
   aiSuggestsFp: boolean;
   /** Attack indicators present (SQLi signals, curated signature combos, etc.). */
   attackIndicators: boolean;
+  /** The risk is driven by BOT detection ("Malicious/Suspicious bot detected"), not by the
+   *  flagged content — so a high req_risk here is NOT evidence the signature/violation is a real
+   *  content attack. Bots are analysed separately (Bot Classification). */
+  botDetected: boolean;
 }
 
 // "AI confirmed", "confirmed attack", "high confidence attack", "100% confidence/attack".
 // Note: a BARE "100%" must NOT match (it appears in benign reasons like "100% cache hit") —
 // the percentage only counts when explicitly tied to confidence/confirmation/attack.
 const CONFIRM_RE = /\bai[\s_-]*confirmed\b|\bconfirmed\s+attack\b|\battack\s+confirmed\b|\bverified\s+attack\b|\bhigh[\s_-]*confidence\s+attack\b|\b100\s*%\s*(?:confidence|confirmed|attack)\b/i;
-// ML/AI leaning benign / false positive / suppression
-const FP_RE = /\b(false[\s_-]*positive|likely\s+benign|appears\s+benign|suppress(ed|ion)?|legitimate\s+(traffic|request)|low\s+risk\s+benign)\b/i;
+// ML/AI leaning benign / false positive / suppression. The suppression alternative requires an
+// affirmative auto/ML prefix so a bare "suppress" inside negated/contextual phrasing (e.g.
+// "attack NOT suppressed") does not falsely read as benign. (Signature AutoSuppressed state is
+// already covered unambiguously by isAutoSuppressedState().)
+const FP_RE = /\b(false[\s_-]*positive|likely\s+benign|appears\s+benign|(?:auto|ml)[\s_-]*suppress(?:ed|ion)|legitimate\s+(?:traffic|request)|low\s+risk\s+benign)\b/i;
 // Attack indicators / curated combinations / signal families
 const INDICATOR_RE = /\b(attack\s+indicator|sqli|xss\s+signal|curated|signature\s+combination|threat\s+campaign|exploit)\b/i;
+// Bot-driven risk: F5 raises req_risk for a detected bot regardless of content (e.g. "Malicious
+// bot detected", "Suspicious bot detected", "Bot Signature: ..."). This is a bot, not a content attack.
+const BOT_RE = /\b(malicious|suspicious)\s+bot\b|\bbot\s+(detected|signature)\b/i;
 
 export function parseRiskReasons(reasons: string[] | string | undefined | null): RiskReasonVerdict {
   const arr: string[] = Array.isArray(reasons)
@@ -105,11 +127,12 @@ export function parseRiskReasons(reasons: string[] | string | undefined | null):
     : reasons
     ? [String(reasons)]
     : [];
-  const verdict: RiskReasonVerdict = { aiConfirmedAttack: false, aiSuggestsFp: false, attackIndicators: false };
+  const verdict: RiskReasonVerdict = { aiConfirmedAttack: false, aiSuggestsFp: false, attackIndicators: false, botDetected: false };
   for (const r of arr) {
     if (CONFIRM_RE.test(r)) verdict.aiConfirmedAttack = true;
     if (FP_RE.test(r)) verdict.aiSuggestsFp = true;
     if (INDICATOR_RE.test(r)) verdict.attackIndicators = true;
+    if (BOT_RE.test(r)) verdict.botDetected = true;
   }
   return verdict;
 }
@@ -165,6 +188,11 @@ export interface AiSignalContribution {
 export function scoreAiRisk(input: AiSignalInput): AiSignalContribution {
   let delta = 0;
   const reasons: string[] = [];
+  const v = input.reasonVerdict;
+  // When F5's req_risk is driven purely by BOT detection (no content attack signals), a HIGH risk
+  // is about the bot — not the flagged signature/violation content. Don't treat it as content-TP
+  // evidence; bots are analysed separately in Bot Classification.
+  const botDriven = !!v?.botDetected && !v.attackIndicators && !v.aiConfirmedAttack;
 
   // 1) req_risk distribution — F5 AI's per-request Likelihood × Impact verdict
   const c = input.riskCounts;
@@ -173,7 +201,9 @@ export function scoreAiRisk(input: AiSignalInput): AiSignalContribution {
     if (known > 0) {
       const lowPct = c.low / known;
       const highPct = c.high / known;
-      if (highPct >= 0.5) {
+      if (highPct >= 0.2 && botDriven) {
+        reasons.push(`F5 AI rated ${(highPct * 100).toFixed(0)}% HIGH risk, but it is BOT-driven (not the flagged content) — not counted as content-attack evidence`);
+      } else if (highPct >= 0.5) {
         delta -= 35;
         reasons.push(`F5 AI rated ${(highPct * 100).toFixed(0)}% of requests HIGH risk — likely real attack`);
       } else if (highPct >= 0.2) {
@@ -190,7 +220,6 @@ export function scoreAiRisk(input: AiSignalInput): AiSignalContribution {
   }
 
   // 2) req_risk_reasons — explicit AI verdict text
-  const v = input.reasonVerdict;
   if (v) {
     if (v.aiConfirmedAttack) {
       delta -= 40;
@@ -206,9 +235,9 @@ export function scoreAiRisk(input: AiSignalInput): AiSignalContribution {
     }
   }
 
-  // 3) AI recommendation (recommended_action / calculated_action)
+  // 3) AI recommendation — a bot-driven "block" is about the bot, not the flagged content.
   const rec = (input.recommendedAction || '').toLowerCase();
-  if (rec === 'block') { delta -= 10; reasons.push('AI recommended_action=block'); }
+  if (rec === 'block' && !botDriven) { delta -= 10; reasons.push('AI recommended_action=block'); }
   else if (rec === 'allow') { delta += 12; reasons.push('AI recommended_action=allow — AI would not block'); }
   else if (rec === 'report') { delta += 6; reasons.push('AI recommended_action=report — not confident enough to block'); }
 

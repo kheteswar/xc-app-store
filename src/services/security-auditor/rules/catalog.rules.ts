@@ -186,8 +186,8 @@ const LB_SERVICE_POLICY: SecurityRule = {
 const LB_IP_REPUTATION: SecurityRule = {
   id: 'AC-02',
   name: 'IP Reputation Enabled',
-  description: 'IP Reputation blocks known-malicious source IPs using F5 threat intelligence. Part of the base bundle and must be explicitly enabled.',
-  category: 'ACCESS_CONTROL', severity: 'HIGH', risk: 'High', entitlement: 'Base',
+  description: 'IP Reputation blocks known-malicious source IPs using F5 threat intelligence. Part of the base bundle; off by default, so enabling it is a recommended hardening step rather than a hard requirement.',
+  category: 'ACCESS_CONTROL', severity: 'MEDIUM', risk: 'Med', entitlement: 'Base',
   expectedDisplay: 'Enabled',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Enable IP Reputation on the load balancer (Security Configuration → enable IP Reputation).',
@@ -196,7 +196,7 @@ const LB_IP_REPUTATION: SecurityRule = {
     const p = getLBPosture(obj);
     return p.ipReputationEnabled
       ? pass('IP Reputation is enabled', 'Enabled', 'Enabled')
-      : fail('IP Reputation is not enabled', 'Disabled', 'Enabled');
+      : warn('IP Reputation is not enabled — recommended to block known-malicious source IPs', 'Disabled', 'Enabled');
   },
 };
 
@@ -206,14 +206,18 @@ const LB_THREAT_MESH: SecurityRule = {
   description: 'Threat Mesh shares cross-tenant threat intelligence. The F5 console default is Disabled, so it must be explicitly enabled.',
   category: 'ACCESS_CONTROL', severity: 'MEDIUM', risk: 'Med', entitlement: 'Base',
   expectedDisplay: 'Enabled',
+  verify: 'assisted',
+  verifyNote: 'Threat Mesh is off by default; leaving it off is a valid choice — confirm whether cross-tenant threat sharing is wanted.',
   appliesTo: ['http_loadbalancer'],
-  remediation: 'Do not disable Threat Mesh unless there is a specific reason; remove the disable_threat_mesh setting.',
+  remediation: 'Enable Threat Mesh in the load balancer Security Configuration to share cross-tenant threat intelligence.',
   referenceUrl: `${DOCS}/how-to/advanced-security`,
   check: (obj) => {
     const p = getLBPosture(obj);
+    // F5 default is Disabled, so "not enabled" is the common, benign case → surface as review (INFO),
+    // not a score-dragging FAIL. Only an explicit-disable would warrant a stronger signal.
     return p.threatMeshEnabled
       ? pass('Threat Mesh is enabled', 'Enabled', 'Enabled')
-      : fail('Threat Mesh is explicitly disabled', 'Disabled', 'Enabled');
+      : info('Threat Mesh is not enabled (F5 default) — enable it to share cross-tenant threat intelligence', 'Disabled', 'Enabled');
   },
 };
 
@@ -266,14 +270,17 @@ const LB_BOT: SecurityRule = {
   description: 'Bot Defense detects and mitigates automated attacks (credential stuffing, scraping, carding). Requires a licensed add-on.',
   category: 'BOT_DEFENSE', severity: 'HIGH', risk: 'High', entitlement: 'Entitlement',
   expectedDisplay: 'Bot Defense policy attached',
+  verify: 'assisted',
+  verifyNote: 'A Bot Defense policy being attached does not confirm it is enforcing (vs monitoring) or covers the right endpoints — verify the policy.',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Attach a Bot Defense policy to the load balancer (requires Bot Defense Standard/Advanced license).',
   referenceUrl: `${DOCS}/how-to/app-security/bot-defense`,
   check: (obj) => {
     const p = getLBPosture(obj);
+    // Licensed add-on: absence is a review item (may not be licensed / needed), not a score-dragging WARN.
     return p.botDefenseEnabled
       ? pass(`Bot Defense attached${p.botPolicyName ? ` (${p.botPolicyName})` : ''}`, p.botPolicyName || 'Enabled', 'Attached')
-      : warn('Bot Defense is not attached', 'Not attached', 'Attached');
+      : info('Bot Defense is not attached (requires a Bot Defense license)', 'Not attached', 'Attached');
   },
 };
 
@@ -300,6 +307,8 @@ const LB_RATE_LIMIT: SecurityRule = {
   description: 'Rate limiting protects against brute-force and volumetric abuse. Metered add-on.',
   category: 'RATE_LIMITING', severity: 'MEDIUM', risk: 'Med', entitlement: 'Entitlement',
   expectedDisplay: 'Configured',
+  verify: 'assisted',
+  verifyNote: 'A rate limiter being present does not mean the threshold is protective — a limit far above real peak traffic offers little protection. Confirm the threshold against observed peak.',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Configure a rate limiter (with an appropriate user identifier) on the load balancer.',
   referenceUrl: `${DOCS}/how-to/app-security/rate-limiting`,
@@ -307,7 +316,7 @@ const LB_RATE_LIMIT: SecurityRule = {
     const p = getLBPosture(obj);
     return p.rateLimitEnabled
       ? pass('Rate limiting is configured', 'Configured', 'Configured')
-      : warn('Rate limiting is not configured', 'Not configured', 'Configured');
+      : info('Rate limiting is not configured (metered add-on)', 'Not configured', 'Configured');
   },
 };
 
@@ -317,6 +326,8 @@ const LB_CSD: SecurityRule = {
   description: 'Client-Side Defense protects against Magecart / formjacking / skimming attacks. Requires a licensed add-on.',
   category: 'CLIENT_SECURITY', severity: 'MEDIUM', risk: 'High', entitlement: 'Entitlement',
   expectedDisplay: 'Enabled on payment/e-commerce LBs',
+  verify: 'assisted',
+  verifyNote: 'Client-Side Defense is only relevant on LBs serving payment / sensitive forms — confirm applicability for this application before treating absence as a gap.',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Enable Client-Side Defense on load balancers serving payment / sensitive forms (requires license).',
   referenceUrl: `${DOCS}/how-to/app-security/client-side-defense`,
@@ -324,7 +335,7 @@ const LB_CSD: SecurityRule = {
     const p = getLBPosture(obj);
     return p.clientSideDefenseEnabled
       ? pass('Client-Side Defense is enabled', 'Enabled', 'Enabled')
-      : warn('Client-Side Defense is not enabled', 'Disabled', 'Enabled (where applicable)');
+      : info('Client-Side Defense is not enabled (licensed add-on; relevant for payment/e-commerce LBs)', 'Disabled', 'Enabled (where applicable)');
   },
 };
 
@@ -510,7 +521,8 @@ const WAF_MODE: SecurityRule = {
     const p = getWafPosture(obj);
     if (p.isBlocking) return pass(`WAF is in ${p.mode === 'AI_RISK_BASED' ? 'AI risk-based blocking' : 'Blocking'} mode`, p.mode, 'Blocking');
     if (p.mode === 'MONITORING') return fail('WAF is in Monitoring mode — attacks are logged but not blocked', 'Monitoring', 'Blocking');
-    return warn('WAF enforcement mode could not be determined', p.mode, 'Blocking');
+    // Indeterminate ≠ misconfigured: don't pollute the score/warnings with a guess — flag for review.
+    return info('WAF enforcement mode could not be determined from config — verify it is set to Blocking', p.mode, 'Blocking');
   },
 };
 
@@ -537,6 +549,8 @@ const WAF_HM_SIGNATURES: SecurityRule = {
   description: 'The WAF should enforce the high & medium accuracy signature set (the default), covering OWASP attack types with low false positives.',
   category: 'WAF', severity: 'HIGH', risk: 'High', entitlement: 'Base',
   expectedDisplay: 'Enabled',
+  verify: 'assisted',
+  verifyNote: 'The active signature set is not always unambiguous from config — confirm the high+medium accuracy set is actually enforced (and not narrowed) in the policy.',
   appliesTo: ['app_firewall'],
   remediation: 'Enable the high & medium accuracy signature set in the App Firewall policy signature selection settings.',
   referenceUrl: `${DOCS}/how-to/app-security/cfg-waf`,
@@ -618,6 +632,8 @@ const LB_MALWARE: SecurityRule = {
   description: 'Malware protection scans uploaded files for malware. It is a licensed add-on and is OFF by default — recommended on load balancers that accept file uploads.',
   category: 'WAF', severity: 'MEDIUM', risk: 'Med', entitlement: 'Entitlement',
   expectedDisplay: 'Enabled (where uploads are accepted)',
+  verify: 'assisted',
+  verifyNote: 'Only relevant on LBs that accept file uploads — confirm whether this application takes uploads before treating absence as a gap.',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Enable Malware Protection (licensed add-on) on load balancers that accept file uploads.',
   referenceUrl: `${DOCS}/how-to/app-security`,
@@ -625,7 +641,7 @@ const LB_MALWARE: SecurityRule = {
     const p = getLBPosture(obj);
     return p.malwareProtectionEnabled
       ? pass('Malware protection is enabled', 'Enabled', 'Enabled')
-      : warn('Malware protection is not enabled (licensed add-on, off by default)', 'Not enabled', 'Enabled (where uploads accepted)');
+      : info('Malware protection is not enabled (licensed add-on, off by default)', 'Not enabled', 'Enabled (where uploads accepted)');
   },
 };
 
@@ -1264,6 +1280,8 @@ const LB_BOT_AI: SecurityRule = {
   description: 'Bot Defense supports per-bot allow/deny for known bots including AI crawlers/agents. Scraping and content-rights posture toward AI bots should be an explicit decision.',
   category: 'BOT_DEFENSE', severity: 'LOW', risk: 'Low', entitlement: 'Entitlement',
   expectedDisplay: 'Explicit allow/deny stance per known/AI bot',
+  verify: 'manual',
+  verifyNote: 'Per-bot AI/known-bot policy intent cannot be judged from config — review against business intent (content licensing, SEO, scraping tolerance).',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Set per-bot actions for AI bots in the Bot Defense policy; review the known-bot dashboard on a regular cadence.',
   referenceUrl: `${DOCS}/how-to/app-security/bot-defense`,
@@ -1280,6 +1298,8 @@ const LB_CSD_DEPTH: SecurityRule = {
   description: 'CSD inventories all inline JavaScript, can alert on new scripts, and supports per-script PCI compliance status — direct evidence for PCI DSS 6.4.3 / 11.6.1.',
   category: 'CLIENT_SECURITY', severity: 'LOW', risk: 'Low', entitlement: 'Entitlement',
   expectedDisplay: 'New-script alerts on; PCI status maintained',
+  verify: 'manual',
+  verifyNote: 'New-script alerting and per-script PCI status are operational/process controls — verify in the CSD dashboard, not derivable from config.',
   appliesTo: ['http_loadbalancer'],
   remediation: 'Enable new-script alerting; assign and review per-script compliance status on release cadence.',
   referenceUrl: `${DOCS}/how-to/app-security/client-side-defense`,
@@ -1418,6 +1438,9 @@ const TENANT_DNSSEC: SecurityRule = {
 const tenantManual = (id: string, name: string, description: string, severity: SecurityRule['severity'], expectedDisplay: string, remediation: string, reviewMsg: string): SecurityRule => ({
   id, name, description, category: 'IAM', severity, risk: severity === 'HIGH' ? 'High' : severity === 'MEDIUM' ? 'Med' : 'Low',
   entitlement: 'Base', expectedDisplay, appliesTo: ['http_loadbalancer'], remediation,
+  // Tenant IAM/SSO/session governance lives outside the LB config graph — not inspectable here.
+  verify: 'manual',
+  verifyNote: 'Tenant-level IAM setting — verify in tenant Administration; it cannot be read from load-balancer config.',
   referenceUrl: `${DOCS}/how-to/user-mgmt`,
   check: () => info(reviewMsg, 'Manual review', expectedDisplay),
 });

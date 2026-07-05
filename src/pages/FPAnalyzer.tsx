@@ -3,8 +3,8 @@ import { Link, useNavigate } from 'react-router-dom';
 import {
   ShieldAlert, Play, ChevronDown, ChevronRight, AlertTriangle,
   Globe, Target, Lock, Check, XCircle, Bot,
-  ArrowLeft, ArrowRight,
-  Download, FileSpreadsheet, HelpCircle,
+  ArrowLeft, ArrowRight, Scale,
+  FileSpreadsheet, HelpCircle,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
@@ -12,7 +12,6 @@ import { apiClient } from '../services/api';
 import type { LoadBalancer, Namespace } from '../types';
 import {
   classifyMatchingInfo,
-  generateFPAnalysisPDF,
   generateFPAnalysisExcel,
   generatePerPathExclusions,
   generateViolationPerPathExclusions,
@@ -523,13 +522,16 @@ function SignatureDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCo
 // VIOLATION DETAIL VIEW
 // ═══════════════════════════════════════════════════════════════
 
-function ViolationDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCount }: {
+function ViolationDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCount, onMarkFP, onMarkTP, manualVerdict }: {
   unit: ViolationAnalysisUnit;
   onBack: () => void;
   onPrev: () => void;
   onNext: () => void;
   currentIdx: number;
   totalCount: number;
+  onMarkFP: () => void;
+  onMarkTP: () => void;
+  manualVerdict?: 'confirmed_fp' | 'confirmed_tp' | 'skipped';
 }) {
   const signals = unit.signals;
 
@@ -783,6 +785,18 @@ function ViolationDetailView({ unit, onBack, onPrev, onNext, currentIdx, totalCo
           </button>
         </div>
       )}
+
+      {/* Manual review actions — recorded against this violation and shown in the downloaded report */}
+      <div className="flex items-center gap-3 mt-4">
+        <button onClick={onMarkFP} className={`px-4 py-2 rounded-lg text-sm border transition-colors ${manualVerdict === 'confirmed_fp' ? 'bg-red-600/40 text-red-200 border-red-500/60' : 'bg-red-600/20 hover:bg-red-600/30 text-red-400 border-red-600/30'}`}>
+          <Check className="w-3.5 h-3.5 inline mr-1" /> Confirm FP
+        </button>
+        <button onClick={onMarkTP} className={`px-4 py-2 rounded-lg text-sm border transition-colors ${manualVerdict === 'confirmed_tp' ? 'bg-emerald-600/40 text-emerald-200 border-emerald-500/60' : 'bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border-emerald-600/30'}`}>
+          <XCircle className="w-3.5 h-3.5 inline mr-1" /> Confirm TP
+        </button>
+        {manualVerdict === 'confirmed_fp' && <span className="text-xs text-red-300">Marked as confirmed false positive — will appear in the downloaded report.</span>}
+        {manualVerdict === 'confirmed_tp' && <span className="text-xs text-emerald-300">Marked as confirmed true positive — will appear in the downloaded report.</span>}
+      </div>
     </div>
   );
 }
@@ -1019,7 +1033,7 @@ export default function FPAnalyzer() {
 
   // ── Analysis config ──
   const [hoursBack, setHoursBack] = useState(168);
-  const [scopes, setScopes] = useState<AnalysisScope[]>(['waf_signatures', 'waf_violations']);
+  const [scopes, setScopes] = useState<AnalysisScope[]>(['waf_signatures', 'waf_violations', 'signature_bots']);
   const [configExpanded, setConfigExpanded] = useState(true);
 
   // ── Job state ──
@@ -1047,10 +1061,10 @@ export default function FPAnalyzer() {
   const [tmEnrichResult, setTmEnrichResult] = useState<ThreatMeshEnrichmentResult | null>(null);
 
   // ── Export state ──
-  const [exportingPdf, setExportingPdf] = useState(false);
 
-  // ── Review state ──
+  // ── Review state (manual analyst confirmations) ──
   const [reviewStatus, setReviewStatus] = useState<Record<string, 'confirmed_fp' | 'confirmed_tp' | 'skipped'>>({});
+  const [violationReviewStatus, setViolationReviewStatus] = useState<Record<string, 'confirmed_fp' | 'confirmed_tp' | 'skipped'>>({});
 
   // ── Summary sorting ──
   const [sortField, setSortField] = useState<'events' | 'users' | 'paths' | 'verdict'>('verdict');
@@ -1062,6 +1076,7 @@ export default function FPAnalyzer() {
 
   // ── Section expansion ──
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    enforcementComparison: true,
     wafComparison: true,
     botAnalysis: true,
     signatures: true,
@@ -1126,6 +1141,7 @@ export default function FPAnalyzer() {
     setSelectedSigId(null);
     setSigDetail(null);
     setReviewStatus({});
+    setViolationReviewStatus({});
     setConfigExpanded(false);
 
     try {
@@ -1329,38 +1345,13 @@ export default function FPAnalyzer() {
     return buildWafExclusionPolicy(selectedLb, selectedNs, allRules);
   }, [selectedLb, selectedNs]);
 
-  const downloadPDF = useCallback(async () => {
-    if (!summary) return;
-    setExportingPdf(true);
-    try {
-      const { sigDetails, violDetails, tmDetails } = await fetchAllDetails();
-      const exclusionPolicy = buildExclusionPolicy(sigDetails);
-
-      generateFPAnalysisPDF({
-        summary,
-        scopes,
-        namespace: selectedNs,
-        lbName: selectedLb,
-        threatMeshDetails: tmDetails,
-        signatureDetails: sigDetails,
-        violationDetails: violDetails,
-        exclusionPolicy,
-      });
-      toast.success('PDF report downloaded');
-    } catch (err) {
-      toast.error('Failed to generate PDF');
-    } finally {
-      setExportingPdf(false);
-    }
-  }, [summary, scopes, selectedNs, selectedLb, fetchAllDetails, buildExclusionPolicy, toast]);
-
   const downloadExcel = useCallback(async () => {
     if (!summary) return;
     try {
       const { sigDetails, violDetails, tmDetails } = await fetchAllDetails();
       const exclusionPolicy = buildExclusionPolicy(sigDetails);
 
-      generateFPAnalysisExcel({
+      await generateFPAnalysisExcel({
         summary,
         scopes,
         namespace: selectedNs,
@@ -1369,12 +1360,17 @@ export default function FPAnalyzer() {
         signatureDetails: sigDetails,
         violationDetails: violDetails,
         exclusionPolicy,
+        signatureReviewStatus: reviewStatus,
+        violationReviewStatus,
       });
       toast.success('Excel report downloaded');
     } catch {
       toast.error('Failed to generate Excel');
     }
-  }, [summary, scopes, selectedNs, selectedLb, fetchAllDetails, buildExclusionPolicy, toast]);
+  }, [summary, scopes, selectedNs, selectedLb, fetchAllDetails, buildExclusionPolicy, reviewStatus, violationReviewStatus, toast]);
+
+  // Blocking-mode comparison is now folded into the main PDF/Excel (top-of-page download) —
+  // no separate comparison download.
 
   const downloadExclusionPolicy = useCallback(async () => {
     if (!summary || !jobId) return;
@@ -1612,6 +1608,7 @@ export default function FPAnalyzer() {
             {([
               { scope: 'waf_signatures' as AnalysisScope, label: 'WAF Signatures' },
               { scope: 'waf_violations' as AnalysisScope, label: 'WAF Violations' },
+              { scope: 'signature_bots' as AnalysisScope, label: 'Signature-based Bots' },
             ]).map(s => (
               <button key={s.scope} onClick={() => toggleScope(s.scope)} disabled={phase !== 'idle'}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${scopes.includes(s.scope)
@@ -1721,6 +1718,10 @@ export default function FPAnalyzer() {
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-4 text-xs">
                 <span className="text-slate-400">{summary.totalEvents.toLocaleString()} events analyzed</span>
+                {(summary.botAnalysis?.maliciousEvents ?? 0) > 0 && (<>
+                  <span className="text-slate-600">|</span>
+                  <span className="text-orange-400">{summary.botAnalysis!.maliciousEvents.toLocaleString()} malicious bot req</span>
+                </>)}
                 {scopes.includes('waf_signatures') && summary.signatures.length > 0 && (<>
                   <span className="text-slate-600">|</span>
                   <span className="text-red-400">{summary.signatures.filter(s => s.fpVerdict === 'highly_likely_fp' || s.fpVerdict === 'likely_fp').length} Likely FP</span>
@@ -1741,15 +1742,12 @@ export default function FPAnalyzer() {
                 {scopes.includes('waf_signatures') && summary.signatures.length > 0 && (
                   <span className="text-xs text-slate-400 mr-2">Reviewed: {confirmedFPCount + confirmedTPCount}/{summary.signatures.length}</span>
                 )}
-                <button onClick={downloadPDF} disabled={exportingPdf}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg border border-blue-600/30 transition-colors disabled:opacity-40"
-                ><Download className="w-3.5 h-3.5" />{exportingPdf ? 'Generating...' : 'PDF'}</button>
                 <button onClick={downloadExcel}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 rounded-lg border border-emerald-600/30 transition-colors"
                 ><FileSpreadsheet className="w-3.5 h-3.5" />Excel</button>
                 <button onClick={downloadExclusionPolicy}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 rounded-lg border border-amber-600/30 transition-colors"
-                  title="Download WAF Exclusion Policy JSON"
+                  title="WAF Exclusion Policy JSON — apply ONLY after confirming a false positive AND checking the AI-WAF does not already auto-allow it (req_risk = false positive / AutoSuppressed). Not a recommendation to apply; provided in case an exclusion is needed."
                 ><Lock className="w-3.5 h-3.5" />WAF Policy</button>
               </div>
             </div>
@@ -1867,168 +1865,11 @@ export default function FPAnalyzer() {
           </div>
           )}
 
-          {/* Traditional vs AI-Powered WAF comparison */}
-          {summary.wafComparison && summary.wafComparison.totalEvents > 0 && (() => {
-            const wc = summary.wafComparison;
-            const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
-            const share = (n: number) => wc.totalEvents > 0 ? pct(n / wc.totalEvents) : '0%';
-            const tuning = [...wc.bySignature].filter(s => s.engineActiveAiBenign > 0).sort((a, b) => b.origin200Pct - a.origin200Pct);
-            const cards = [
-              { n: wc.matrix.bothAttack, title: 'Real attack — both agree', sub: 'Signature flagged + AI rates high/medium risk', cls: 'bg-slate-800 border-slate-600', num: 'text-slate-200', icon: '✓' },
-              { n: wc.matrix.engineActiveAiBenign, title: 'Likely false positive', sub: 'Signature still Enabled, but AI rates benign — AI-based blocking would skip these', cls: 'bg-amber-900/20 border-amber-700/50', num: 'text-amber-300', icon: '⚠' },
-              { n: wc.matrix.aiSuppressedRiskAttack, title: 'AI flags, signature suppressed', sub: 'AI sees risk on a signature the auto-tuning already suppressed — review', cls: 'bg-red-900/20 border-red-700/50', num: 'text-red-300', icon: '⚠' },
-              { n: wc.matrix.bothBenign, title: 'False positive — auto-tuned out', sub: 'AutoSuppressed by F5 tuning + AI agrees benign (working as intended)', cls: 'bg-emerald-900/20 border-emerald-700/50', num: 'text-emerald-300', icon: '✓' },
-            ];
-            return (
-            <Section title="Traditional vs AI-Powered WAF" icon={Target} expanded={expandedSections.wafComparison} onToggle={() => toggleSection('wafComparison')} badge={pct(wc.agreementPct)}>
-              {/* Plain-language headline (analysis — the action plan is in Recommendations above) */}
-              <p className="text-sm text-slate-200 mb-3">{wc.headline}</p>
-
-              {/* Enforcement note (e.g. monitoring → attacks not blocked) */}
-              {wc.enforcementNote && (
-                <div className="bg-amber-900/20 border border-amber-700/40 rounded-lg p-2.5 mb-3 text-xs text-amber-300">⚠ {wc.enforcementNote}</div>
-              )}
-
-              {/* How the engines classified the flagged requests (matrix → 4 plain cards) */}
-              <div className="text-xs text-slate-400 mb-1.5">How both engines classified the {wc.totalEvents.toLocaleString()} flagged requests:</div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
-                {cards.map((c, i) => (
-                  <div key={i} className={`${c.cls} border rounded-lg p-2.5`}>
-                    <div className="flex items-baseline justify-between">
-                      <span className="text-xs font-medium text-slate-200">{c.icon} {c.title}</span>
-                      <span className={`text-base font-bold ${c.num}`}>{c.n.toLocaleString()} <span className="text-[10px] text-slate-500">({share(c.n)})</span></span>
-                    </div>
-                    <p className="text-[10px] text-slate-400 mt-0.5">{c.sub}</p>
-                  </div>
-                ))}
-              </div>
-
-              {/* Compact stats line */}
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400 mb-3">
-                <span>AI verdict coverage: <span className="text-slate-300">{pct(wc.aiDataCoveragePct)}</span></span>
-                <span>FP-block reduction if AI enabled: <span className="text-amber-300">{pct(wc.fpReductionOpportunityPct)}</span></span>
-                <span>AI-benign served 200 (FP corroboration): <span className="text-emerald-300">{pct(wc.aiBenignOrigin200Pct)}</span></span>
-                <span>Already auto-suppressed: <span className="text-slate-300">{wc.alreadySuppressedByAi.toLocaleString()}</span></span>
-              </div>
-
-              {/* Tuning candidates */}
-              {tuning.length > 0 && (<>
-                <div className="text-xs text-slate-400 mb-1">Tuning candidates — Enabled signatures the AI rates benign <span className="text-slate-500">(Origin 200% = how often the app actually served the request; higher = stronger false-positive evidence)</span>:</div>
-                <table className="w-full text-xs">
-                  <thead><tr className="text-slate-400 border-b border-slate-700">
-                    <th className="text-left py-1 pr-2">Sig ID</th><th className="text-left py-1 pr-2">Name</th>
-                    <th className="text-right py-1 pr-2">Events</th><th className="text-right py-1 pr-2">AI Benign</th>
-                    <th className="text-right py-1 pr-2">Origin 200%</th><th className="text-right py-1">FP evidence</th>
-                  </tr></thead>
-                  <tbody>
-                    {tuning.slice(0, 10).map(s => (
-                      <tr key={s.sigId} className="border-b border-slate-700/50">
-                        <td className="py-1 pr-2 font-mono text-slate-300">{s.sigId}</td>
-                        <td className="py-1 pr-2 text-slate-300 truncate max-w-xs">{s.name}</td>
-                        <td className="py-1 pr-2 text-right text-slate-300">{s.events}</td>
-                        <td className="py-1 pr-2 text-right text-amber-300">{s.aiBenign}</td>
-                        <td className="py-1 pr-2 text-right text-emerald-300">{pct(s.origin200Pct)}</td>
-                        <td className={`py-1 text-right ${s.origin200Pct >= 0.5 ? 'text-emerald-400' : 'text-slate-500'}`}>{s.origin200Pct >= 0.5 ? 'strong' : 'weak'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>)}
-            </Section>
-            );
-          })()}
-
-          {/* Bot Classification — is it safe to block the Malicious bots? */}
-          {summary.botAnalysis && (() => {
-            const ba = summary.botAnalysis;
-            const cc = ba.classificationCounts;
-            const counts = [
-              { label: 'Malicious', n: cc.malicious, cls: 'text-red-300' },
-              { label: 'Suspicious', n: cc.suspicious, cls: 'text-amber-300' },
-              { label: 'Benign / Good', n: cc.benign, cls: 'text-emerald-300' },
-              { label: 'Human', n: cc.human, cls: 'text-slate-300' },
-              { label: 'Unknown', n: cc.unknown, cls: 'text-slate-500' },
-            ];
-            const hasRisk = ba.fpRiskFlags.length > 0;
-            const recCls = ba.maliciousEvents > 0 && !hasRisk ? 'bg-emerald-900/20 border-emerald-700/40 text-emerald-200'
-              : hasRisk ? 'bg-amber-900/20 border-amber-700/40 text-amber-200'
-              : 'bg-slate-800 border-slate-600 text-slate-300';
-            const flagLabels = new Set(ba.fpRiskFlags.map(f => f.label));
-            return (
-            <Section title="Bot Classification" icon={Bot} expanded={expandedSections.botAnalysis} onToggle={() => toggleSection('botAnalysis')} badge={ba.maliciousIps}>
-              <div className={`border rounded-lg p-2.5 mb-3 text-sm ${recCls}`}>{ba.recommendation}</div>
-              <div className="text-xs text-slate-400 mb-1.5">F5 Bot Defense classification across WAF events <span className="text-slate-500">(only Malicious is blocked; Suspicious and Good/Benign are allowed/ignored)</span>:</div>
-              <div className="flex flex-wrap gap-2 mb-3">
-                {counts.map((c, i) => (
-                  <div key={i} className="bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-1.5">
-                    <span className="text-xs text-slate-400">{c.label}</span>{' '}
-                    <span className={`text-sm font-bold ${c.cls}`}>{c.n.toLocaleString()}</span>
-                  </div>
-                ))}
-              </div>
-              {ba.maliciousEvents > 0 ? (<>
-                <div className="text-xs text-slate-400 mb-2">{ba.maliciousEvents.toLocaleString()} malicious events from {ba.maliciousIps.toLocaleString()}{ba.ipsCapped ? '+' : ''} distinct client(s){ba.ipsCapped ? ' (top 500 shown)' : ''}. <span className="text-slate-500">Computed from server-side aggregation — no raw malicious-bot logs downloaded.</span></div>
-
-                {hasRisk && (
-                  <div className="bg-amber-900/15 border border-amber-700/40 rounded-lg p-2.5 mb-3">
-                    <div className="text-[11px] font-semibold text-amber-300 mb-1">⚠ Potential false positives in the Malicious set — verify before blocking:</div>
-                    <ul className="text-[11px] text-slate-300 space-y-0.5">
-                      {ba.fpRiskFlags.map((f, i) => (
-                        <li key={i} className="truncate" title={f.label}>
-                          <span className={`text-[10px] px-1 py-0.5 rounded mr-1 ${f.kind === 'known_good_bot' ? 'bg-red-900/40 text-red-300' : 'bg-amber-900/40 text-amber-300'}`}>{f.kind === 'known_good_bot' ? 'known-good bot' : 'real browser'}</span>
-                          <span className="font-mono text-slate-300">{f.label}</span> <span className="text-slate-500">({f.count.toLocaleString()} events)</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div>
-                    <div className="text-xs text-slate-400 mb-1">Top malicious source IPs:</div>
-                    <table className="w-full text-xs">
-                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">Source IP</th><th className="text-right py-1">Events</th></tr></thead>
-                      <tbody>
-                        {ba.topMaliciousIps.map((b, i) => (
-                          <tr key={i} className="border-b border-slate-700/50"><td className="py-1 pr-2 font-mono text-slate-300">{b.key}</td><td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td></tr>
-                        ))}
-                        {ba.topMaliciousIps.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
-                      </tbody>
-                    </table>
-                  </div>
-                  <div>
-                    <div className="text-xs text-slate-400 mb-1">Top user-agents in the Malicious set <span className="text-slate-500">(⚠ = possible FP)</span>:</div>
-                    <table className="w-full text-xs">
-                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">User-Agent</th><th className="text-right py-1">Events</th></tr></thead>
-                      <tbody>
-                        {ba.topUserAgents.map((b, i) => {
-                          const risky = flagLabels.has(b.key);
-                          return (
-                          <tr key={i} className="border-b border-slate-700/50">
-                            <td className={`py-1 pr-2 max-w-[260px] truncate ${risky ? 'text-amber-300' : 'text-slate-300'}`} title={b.key}>{risky ? '⚠ ' : ''}{b.key}</td>
-                            <td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td>
-                          </tr>
-                          );
-                        })}
-                        {ba.topUserAgents.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-                {ba.topCountries.length > 0 && (
-                  <div className="text-[11px] text-slate-400 mt-2">Top countries: {ba.topCountries.slice(0, 8).map(c => `${c.key} (${c.count.toLocaleString()})`).join(', ')}</div>
-                )}
-              </>) : (
-                <div className="text-xs text-slate-500">No Malicious-classified bots in this window — nothing to block.</div>
-              )}
-            </Section>
-            );
-          })()}
-
           {/* WAF Signatures section — only if scope selected */}
           {scopes.includes('waf_signatures') && (
             <Section title="WAF Signatures" icon={ShieldAlert} expanded={expandedSections.signatures} onToggle={() => toggleSection('signatures')} badge={summary.signatures.length}>
               {summary.signatures.length > 0 ? (<>
+                <p className="text-[11px] text-slate-500 mb-2">FP scoring here excludes confirmed malicious-bot traffic (analysed in Malicious Bots). The Blocking-Mode Comparison counts all flagged requests, including bots — so its totals can be higher.</p>
                 {/* Sort controls */}
                 <div className="flex items-center gap-2 mb-3 text-xs text-slate-400">
                   <span>Sort by:</span>
@@ -2125,6 +1966,7 @@ export default function FPAnalyzer() {
                       <th className="text-right py-2 pr-2 w-16">Users</th>
                       <th className="text-right py-2 pr-2 w-16">FP Score</th>
                       <th className="text-center py-2 w-32">Verdict</th>
+                      <th className="text-center py-2 w-20">Status</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2147,6 +1989,10 @@ export default function FPAnalyzer() {
                         <td className="py-2 text-center">
                           <VerdictBadge verdict={vDisplayVerdict} />
                         </td>
+                        <td className="py-2 text-center">
+                          {violationReviewStatus[v.violationName] === 'confirmed_fp' && <span className="text-red-400 text-[10px]">FP</span>}
+                          {violationReviewStatus[v.violationName] === 'confirmed_tp' && <span className="text-emerald-400 text-[10px]">TP</span>}
+                        </td>
                       </tr>
                       );
                     })}
@@ -2157,6 +2003,107 @@ export default function FPAnalyzer() {
               )}
             </Section>
           )}
+
+          {/* Bot Classification — is it safe to block the Malicious bots? */}
+          {summary.botAnalysis && (() => {
+            const ba = summary.botAnalysis;
+            const cc = ba.classificationCounts;
+            const counts = [
+              { label: 'Malicious', n: cc.malicious, cls: 'text-red-300' },
+              { label: 'Suspicious', n: cc.suspicious, cls: 'text-amber-300' },
+              { label: 'Benign / Good', n: cc.benign, cls: 'text-emerald-300' },
+              { label: 'Human', n: cc.human, cls: 'text-slate-300' },
+              { label: 'Unknown', n: cc.unknown, cls: 'text-slate-500' },
+            ];
+            const hasRisk = ba.fpRiskFlags.length > 0;
+            const recCls = ba.maliciousEvents > 0 && !hasRisk ? 'bg-emerald-900/20 border-emerald-700/40 text-emerald-200'
+              : hasRisk ? 'bg-amber-900/20 border-amber-700/40 text-amber-200'
+              : 'bg-slate-800 border-slate-600 text-slate-300';
+            const flagLabels = new Set(ba.fpRiskFlags.map(f => f.label));
+            return (
+            <Section title="Malicious Bots" icon={Bot} expanded={expandedSections.botAnalysis} onToggle={() => toggleSection('botAnalysis')} badge={ba.maliciousEvents}>
+              <div className={`border rounded-lg p-2.5 mb-3 text-sm ${recCls}`}>{ba.recommendation}</div>
+              <div className="text-xs text-slate-400 mb-1.5">F5 Bot Defense classification across WAF events <span className="text-slate-500">(only Malicious is blocked; Suspicious and Good/Benign are allowed/ignored)</span>:</div>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {counts.map((c, i) => (
+                  <div key={i} className="bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-1.5">
+                    <span className="text-xs text-slate-400">{c.label}</span>{' '}
+                    <span className={`text-sm font-bold ${c.cls}`}>{c.n.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+              {ba.maliciousEvents > 0 ? (<>
+                <div className="text-xs text-slate-400 mb-2">{ba.maliciousEvents.toLocaleString()} malicious events from {ba.maliciousIps.toLocaleString()}{(ba.breakdownSampled || ba.ipsCapped) ? '+' : ''} distinct client(s){ba.ipsCapped && !ba.breakdownSampled ? ' (top 500 shown)' : ''}. {ba.breakdownSampled
+                  ? <span className="text-amber-500/80">Total is exact; the per-client/path breakdown is from a sample of {(ba.breakdownSampleSize || 0).toLocaleString()} events (server-side aggregation unavailable here) — distinct clients and per-IP counts are a lower bound.</span>
+                  : <span className="text-slate-500">Total is the exact count (server-side total_hits); per-client/path counts are aggregated across all malicious events, so the top IPs and their counts are accurate even on heavily-scanned LBs.</span>}</div>
+
+                {hasRisk && (
+                  <div className="bg-amber-900/15 border border-amber-700/40 rounded-lg p-2.5 mb-3">
+                    <div className="text-[11px] font-semibold text-amber-300 mb-1">⚠ Potential false positives in the Malicious set — verify before blocking:</div>
+                    <ul className="text-[11px] text-slate-300 space-y-0.5">
+                      {ba.fpRiskFlags.map((f, i) => (
+                        <li key={i} className="truncate" title={f.label}>
+                          <span className={`text-[10px] px-1 py-0.5 rounded mr-1 ${f.kind === 'known_good_bot' ? 'bg-red-900/40 text-red-300' : 'bg-amber-900/40 text-amber-300'}`}>{f.kind === 'known_good_bot' ? 'known-good bot' : 'real browser'}</span>
+                          <span className="font-mono text-slate-300">{f.label}</span> <span className="text-slate-500">({f.count.toLocaleString()} events)</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Top malicious source IPs:</div>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">Source IP</th><th className="text-right py-1">Events</th></tr></thead>
+                      <tbody>
+                        {ba.topMaliciousIps.map((b, i) => (
+                          <tr key={i} className="border-b border-slate-700/50"><td className="py-1 pr-2 font-mono text-slate-300">{b.key}</td><td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td></tr>
+                        ))}
+                        {ba.topMaliciousIps.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Top user-agents in the Malicious set <span className="text-slate-500">(⚠ = possible FP)</span>:</div>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-slate-400 border-b border-slate-700"><th className="text-left py-1 pr-2">User-Agent</th><th className="text-right py-1">Events</th></tr></thead>
+                      <tbody>
+                        {ba.topUserAgents.map((b, i) => {
+                          const risky = flagLabels.has(b.key);
+                          return (
+                          <tr key={i} className="border-b border-slate-700/50">
+                            <td className={`py-1 pr-2 max-w-[260px] truncate ${risky ? 'text-amber-300' : 'text-slate-300'}`} title={b.key}>{risky ? '⚠ ' : ''}{b.key}</td>
+                            <td className="py-1 text-right text-slate-300">{b.count.toLocaleString()}</td>
+                          </tr>
+                          );
+                        })}
+                        {ba.topUserAgents.length === 0 && <tr><td colSpan={2} className="py-1 text-slate-500">—</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                {ba.topCountries.length > 0 && (
+                  <div className="text-[11px] text-slate-400 mt-2">Top countries: {ba.topCountries.slice(0, 8).map(c => `${c.key} (${c.count.toLocaleString()})`).join(', ')}</div>
+                )}
+                {/* Enriched malicious-bot detail (aggregated): type, detecting signature, network, AI risk */}
+                {(ba.topBotTypes.length > 0 || ba.topBotNames.length > 0 || ba.topPaths.length > 0 || ba.topDetectionSources.length > 0 || ba.topAsOrgs.length > 0 || ba.reqRiskDist.length > 0) && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-slate-400 mt-2">
+                    {ba.topBotTypes.length > 0 && <div>Bot type: <span className="text-slate-300">{ba.topBotTypes.slice(0, 6).map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.topBotNames.length > 0 && <div>Bot name: <span className="text-slate-300">{ba.topBotNames.slice(0, 6).map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.topPaths.length > 0 && <div className="md:col-span-2">Paths targeted: <span className="text-slate-300">{ba.topPaths.slice(0, 8).map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.topDetectionSources.length > 0 && <div>Detection / signature: <span className="text-slate-300">{ba.topDetectionSources.slice(0, 6).map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.topAsOrgs.length > 0 && <div>Network (AS org): <span className="text-slate-300">{ba.topAsOrgs.slice(0, 6).map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.reqRiskDist.length > 0 && <div>AI req_risk: <span className="text-slate-300">{ba.reqRiskDist.map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span></div>}
+                    {ba.actionDist.length > 0 && <div>WAF action now: <span className="text-amber-300">{ba.actionDist.map(b => `${b.key} (${b.count.toLocaleString()})`).join(', ')}</span> <span className="text-slate-500">→ F5 recommends</span> <span className="text-emerald-300">{ba.recommendationDist.map(b => b.key).join(', ') || 'block'}</span></div>}
+                  </div>
+                )}
+              </>) : (
+                <div className="text-xs text-slate-500">No Malicious-classified bots in this window — nothing to block.</div>
+              )}
+            </Section>
+            );
+          })()}
 
           {/* Threat Mesh summary — only if scope selected */}
           {scopes.includes('threat_mesh') && (
@@ -2256,6 +2203,104 @@ export default function FPAnalyzer() {
               )}
             </Section>
           )}
+
+          {/* Blocking-Mode Comparison — which enforcement policy to switch on, at what exclusion overhead */}
+          {summary.enforcementComparison && summary.enforcementComparison.totalRequests > 0 && (() => {
+            const ec = summary.enforcementComparison;
+            const pctv = (x: number | null) => x == null ? 'n/a' : `${Math.floor(x * 100)}%`;
+            const shortName: Record<string, string> = { legacy_accuracy: 'Legacy', ai_risk_high: 'AI High', ai_risk_high_med: 'AI High+Med' };
+            const polColor: Record<string, string> = { legacy_accuracy: 'text-slate-200', ai_risk_high: 'text-blue-300', ai_risk_high_med: 'text-violet-300' };
+            const recPolicy = ec.policies.find(p => p.policy === ec.recommended);
+            return (
+            <Section title="Blocking-Mode Comparison" icon={Scale} expanded={expandedSections.enforcementComparison} onToggle={() => toggleSection('enforcementComparison')} badge={shortName[ec.recommended] || 'rec'}>
+              <p className="text-sm text-slate-200 mb-2">{ec.headline}</p>
+              <div className="bg-emerald-900/20 border border-emerald-700/40 rounded-lg p-2.5 mb-3 text-xs text-emerald-200">
+                <span className="font-semibold">Recommended: {recPolicy?.label}.</span> {ec.recommendationReason}
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400 mb-3">
+                <span>{ec.totalRequests.toLocaleString()} requests (sigs + violations + malicious bots)</span>
+                <span>real attacks: <span className="text-slate-300">{ec.totalTpRequests.toLocaleString()}</span></span>
+                <span>all-FP requests: <span className="text-slate-300">{ec.totalFpRequests.toLocaleString()}</span></span>
+                <span>legacy-only blocks (AI avoids): <span className="text-amber-300">{ec.legacyOnlyBlocked.toLocaleString()}</span></span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs mb-2">
+                  <thead><tr className="text-slate-400 border-b border-slate-700">
+                    <th className="text-left py-1.5 pr-2">Blocking policy</th>
+                    <th className="text-right py-1.5 pr-2">Blocked</th>
+                    <th className="text-right py-1.5 pr-2" title="Blocks that stop a real attack">Real-attack</th>
+                    <th className="text-right py-1.5 pr-2" title="Benign blocks that need exclusion rules">FP blocks</th>
+                    <th className="text-right py-1.5 pr-2" title="Blocked detections that are neither clearly a real attack nor clearly a false positive — need manual review">Ambiguous</th>
+                    <th className="text-right py-1.5 pr-2" title="% of all real attacks this policy blocks">Coverage</th>
+                    <th className="text-right py-1.5 pr-2" title="Real attacks NOT blocked">Missed</th>
+                    <th className="text-right py-1.5" title="WAF exclusion rules needed to clear the FP blocks">Excl. rules</th>
+                  </tr></thead>
+                  <tbody>
+                    {ec.policies.map(p => {
+                      const isRec = p.policy === ec.recommended;
+                      return (
+                      <tr key={p.policy} className={`border-b border-slate-700/50 ${isRec ? 'bg-emerald-900/15' : ''}`}>
+                        <td className={`py-1.5 pr-2 font-medium ${polColor[p.policy] || 'text-slate-200'}`}>{isRec && <span className="text-emerald-400 mr-1">★</span>}{p.label}</td>
+                        <td className="py-1.5 pr-2 text-right text-slate-300">{p.blockedRequests.toLocaleString()}</td>
+                        <td className="py-1.5 pr-2 text-right text-emerald-300">{p.tpBlocked.toLocaleString()}</td>
+                        <td className="py-1.5 pr-2 text-right text-amber-300">{p.fpBlocked.toLocaleString()}</td>
+                        <td className={`py-1.5 pr-2 text-right ${p.ambiguousBlocked > 0 ? 'text-slate-400' : 'text-slate-600'}`}>{p.ambiguousBlocked.toLocaleString()}</td>
+                        <td className="py-1.5 pr-2 text-right text-slate-300">{pctv(p.attackCoveragePct)}</td>
+                        <td className={`py-1.5 pr-2 text-right ${p.attacksMissed > 0 ? 'text-red-300' : 'text-slate-500'}`}>{p.attacksMissed.toLocaleString()}</td>
+                        <td className={`py-1.5 text-right font-semibold ${isRec ? 'text-emerald-300' : 'text-red-300'}`}>{p.exclusionRulesNeeded.toLocaleString()}</td>
+                      </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[10px] text-slate-500 mb-3">★ recommended. <span className="text-slate-400">Excl. rules</span> = distinct WAF exclusion rules you'd write to clear that policy's false-positive blocks — fewer = less tuning overhead. Legacy ignores AI auto-suppression, so AutoSuppressed signatures still block under it. <span className="text-slate-400">This comparison is included in the main PDF/Excel download at the top.</span></p>
+
+              {ec.narrative && ec.narrative.length > 0 && (
+                <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 mb-3">
+                  <div className="text-xs font-semibold text-slate-300 mb-1.5">Findings & reasoning</div>
+                  <ul className="list-disc pl-4 space-y-1.5 text-[11px] text-slate-400 leading-relaxed">
+                    {ec.narrative.map((line, i) => <li key={i}>{line}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {/* Which WAF suppresses each false positive (the single consolidated comparison now lives here) */}
+              {summary.wafComparison && summary.wafComparison.fpSuppression.length > 0 && (
+                <div className="mt-1">
+                  <div className="text-xs text-slate-400 mb-1.5">Which WAF catches each false positive — traditional <span className="text-blue-300">state = AutoSuppressed</span> vs AI <span className="text-emerald-300">req_risk = false positive</span>:</div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-slate-400 border-b border-slate-700">
+                        <th className="text-left py-1 pr-2">Sig ID</th><th className="text-left py-1 pr-2">Name</th>
+                        <th className="text-right py-1 pr-2">Events</th>
+                        <th className="text-right py-1 pr-2" title="Events the traditional engine AutoSuppressed (signature state = AutoSuppressed)">Traditional AutoSuppressed</th>
+                        <th className="text-right py-1 pr-2" title="Events the AI rated req_risk = false positive">AI false positive</th>
+                        <th className="text-right py-1 pr-2" title="Events where the signature is still Enabled — the traditional WAF would still block these">Traditional still blocks</th>
+                        <th className="text-left py-1" title="Which engine caught the false positive">Verdict</th>
+                      </tr></thead>
+                      <tbody>
+                        {summary.wafComparison.fpSuppression.slice(0, 10).map(f => (
+                          <tr key={f.sigId} className="border-b border-slate-700/50">
+                            <td className="py-1 pr-2 font-mono text-slate-300">{f.sigId}</td>
+                            <td className="py-1 pr-2 text-slate-300 truncate max-w-[200px]" title={f.name}>{f.name}</td>
+                            <td className="py-1 pr-2 text-right text-slate-300">{f.events.toLocaleString()}</td>
+                            <td className="py-1 pr-2 text-right text-blue-300">{f.autoSuppressed.toLocaleString()}</td>
+                            <td className="py-1 pr-2 text-right text-emerald-300">{f.aiFalsePositive.toLocaleString()}</td>
+                            <td className={`py-1 pr-2 text-right ${f.stillEnabled > 0 ? 'text-amber-300' : 'text-slate-500'}`}>{f.stillEnabled.toLocaleString()}</td>
+                            <td className={`py-1 ${f.verdict.startsWith('AI') ? 'text-emerald-300' : f.verdict.startsWith('Both') ? 'text-slate-300' : 'text-blue-300'}`}>{f.verdict}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-1"><span className="text-emerald-300">AI catches it — traditional still blocks</span> = the AI's req_risk flags a false positive the signature engine would still block, so AI-powered WAF avoids that block (one fewer exclusion rule). <span className="text-blue-300">Traditional catches it</span> = the engine AutoSuppressed it; AI did not call it a false positive.</p>
+                </div>
+              )}
+            </Section>
+            );
+          })()}
+
         </div>
       )}
 
@@ -2306,6 +2351,15 @@ export default function FPAnalyzer() {
               onNext={goToNextViol}
               currentIdx={currentViolIdx}
               totalCount={violationsList.length}
+              manualVerdict={violationReviewStatus[violDetail.violationName]}
+              onMarkFP={() => {
+                setViolationReviewStatus(prev => ({ ...prev, [violDetail.violationName]: 'confirmed_fp' }));
+                toast.success(`Violation "${violDetail.violationName}" marked as FP`);
+              }}
+              onMarkTP={() => {
+                setViolationReviewStatus(prev => ({ ...prev, [violDetail.violationName]: 'confirmed_tp' }));
+                toast.info(`Violation "${violDetail.violationName}" marked as TP`);
+              }}
             />
           )}
         </div>

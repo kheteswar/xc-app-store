@@ -21,7 +21,13 @@ import type {
   NamespaceSummary,
   LoadBalancerSummary,
   ScopeSummary,
+  FetchError,
 } from './types';
+
+// A partial object is a list-view stub left behind when its detail GET failed (spec absent). Rules must
+// not run posture logic on it (false PASS/FAIL) — the scan loop emits a manual-verify finding instead.
+const isPartialObject = (o: unknown): boolean =>
+  !!(o && typeof o === 'object' && (o as Record<string, unknown>).__partial === true);
 
 // Helper to safely get metadata from object
 const getMetadata = (obj: unknown): Record<string, unknown> => {
@@ -39,25 +45,34 @@ const SEVERITY_WEIGHT: Record<Severity, number> = {
 };
 
 // Severity-weighted score: PASS earns full weight, WARN half, FAIL zero;
-// SKIP/ERROR are excluded entirely. Returns 0-100 (100 = all relevant checks pass).
-function weightedScore(items: AuditFinding[]): number {
+// SKIP/ERROR/INFO are excluded entirely (INFO = "review / confirm intent", not a pass or fail).
+// Shared sub-objects (one WAF/pool/cert referenced by N LBs) are de-duped by objectKey|ruleId so they
+// count once. Returns the 0-100 score AND scoredCount (how many checks actually contributed) — when
+// scoredCount is 0 the score is meaningless and callers should render N/A rather than a red 0.
+function weightedScore(items: AuditFinding[]): { score: number; scoredCount: number } {
   let num = 0;
   let den = 0;
+  let scoredCount = 0;
+  const seen = new Set<string>();
   for (const f of items) {
-    // SKIP/ERROR/INFO are excluded from the score (INFO = "confirm intent").
     if (f.status === 'SKIP' || f.status === 'ERROR' || f.status === 'INFO') continue;
+    const key = `${f.objectKey}|${f.ruleId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     const w = SEVERITY_WEIGHT[f.severity] ?? 1;
     den += w;
+    scoredCount++;
     if (f.status === 'PASS') num += w;
     else if (f.status === 'WARN') num += w * 0.5;
   }
-  return den > 0 ? Math.round((num / den) * 100) : 0;
+  return { score: den > 0 ? Math.round((num / den) * 100) : 0, scoredCount };
 }
 
 export class AuditEngine {
   private rules: SecurityRule[] = allRules;
   private onProgress?: (progress: AuditProgress) => void;
   private aborted = false;
+  private fetchErrors: FetchError[] = [];
 
   constructor(onProgress?: (progress: AuditProgress) => void) {
     this.onProgress = onProgress;
@@ -131,7 +146,8 @@ export class AuditEngine {
       namespace: string,
       objectType: ConfigObjectType,
       objectName: string,
-      loadBalancer: string
+      loadBalancer: string,
+      objectKey?: string
     ) => {
       const base = {
         ruleId: rule.id,
@@ -144,9 +160,20 @@ export class AuditEngine {
         objectType,
         objectName,
         loadBalancer,
+        objectKey: objectKey || `${namespace}/${objectType}/${objectName}`,
+        verify: rule.verify ?? 'auto',
+        verifyNote: rule.verifyNote,
         remediation: rule.remediation,
         referenceUrl: rule.referenceUrl,
       };
+      // A partial object is the list-view stub left when its detail GET failed — its spec is absent, so
+      // running posture rules on it yields false PASS/FAIL. Emit one manual-verify finding and skip it.
+      if (isPartialObject(object)) {
+        findings.push({ ...base, status: 'INFO', verify: 'manual',
+          verifyNote: 'Object could not be fully retrieved (partial config) — verify this control manually.',
+          message: `${objectType.replace(/_/g, ' ')} "${objectName}" could not be fully retrieved; this control was not evaluated.` });
+        return;
+      }
       try {
         const result = rule.check(object, context);
         findings.push({
@@ -169,7 +196,14 @@ export class AuditEngine {
     const usedCert = new Set<string>();
     const usedSP = new Set<string>();
 
-    const lbEntries = [...context.configs.httpLoadBalancers.entries()];
+    // LB-level scope (Tier 1): when the user picked specific LBs, audit only those. Tenant/namespace
+    // checks below still run at their true scope.
+    const scopedLbs = options?.loadBalancers && options.loadBalancers.length > 0
+      ? new Set(options.loadBalancers.map((l) => `${l.namespace}/${l.name}`))
+      : null;
+
+    const lbEntries = [...context.configs.httpLoadBalancers.entries()]
+      .filter(([lbKey]) => !scopedLbs || scopedLbs.has(lbKey));
     const totalLb = Math.max(lbEntries.length, 1);
     let lbIndex = 0;
 
@@ -183,7 +217,7 @@ export class AuditEngine {
         lbObj) as Record<string, unknown>;
 
       // LB-level checks
-      for (const rule of lbRules) addFinding(rule, lbObj, lbNs, 'http_loadbalancer', lbName, lbName);
+      for (const rule of lbRules) addFinding(rule, lbObj, lbNs, 'http_loadbalancer', lbName, lbName, lbKey);
 
       // Origin pools referenced by this LB (+ their health checks)
       for (const ref of this.collectPoolRefs(spec)) {
@@ -192,7 +226,7 @@ export class AuditEngine {
         usedPools.add(resolved.key);
         const poolNs = resolved.key.split('/')[0] || lbNs;
         const name = (getMetadata(resolved.obj).name as string) || ref.name;
-        for (const rule of opRules) addFinding(rule, resolved.obj, lbNs, 'origin_pool', name, lbName);
+        for (const rule of opRules) addFinding(rule, resolved.obj, lbNs, 'origin_pool', name, lbName, resolved.key);
 
         // Health checks referenced by this origin pool
         if (hcRules.length > 0) {
@@ -206,7 +240,7 @@ export class AuditEngine {
             const hc = this.resolveRef(context.configs.healthChecks, hcRef, poolNs);
             if (!hc) continue;
             const hcName = (getMetadata(hc.obj).name as string) || hcRef.name;
-            for (const rule of hcRules) addFinding(rule, hc.obj, lbNs, 'healthcheck', `${name} / ${hcName}`, lbName);
+            for (const rule of hcRules) addFinding(rule, hc.obj, lbNs, 'healthcheck', `${name} / ${hcName}`, lbName, hc.key);
           }
         }
       }
@@ -218,7 +252,18 @@ export class AuditEngine {
         if (resolved) {
           usedWaf.add(resolved.key);
           const name = (getMetadata(resolved.obj).name as string) || wafRef.name;
-          for (const rule of wafObjRules) addFinding(rule, resolved.obj, lbNs, 'app_firewall', name, lbName);
+          for (const rule of wafObjRules) addFinding(rule, resolved.obj, lbNs, 'app_firewall', name, lbName, resolved.key);
+        } else if (wafObjRules.length > 0) {
+          // Dark-spot guard: the LB references a WAF policy we could not retrieve (often in a shared/system
+          // namespace) — do NOT silently skip the most important checks; flag for manual verification.
+          findings.push({
+            ruleId: 'WAFP-REF', ruleName: 'WAF policy retrievable', severity: 'HIGH', risk: 'High',
+            entitlement: 'Base', category: 'WAF', namespace: lbNs, objectType: 'app_firewall',
+            objectName: wafRef.name, loadBalancer: lbName, objectKey: `${wafRef.namespace || lbNs}/app_firewall/${wafRef.name}`,
+            verify: 'manual', verifyNote: 'WAF policy is attached but could not be retrieved (it may live in a shared/system namespace) — verify its mode and tuning manually.',
+            status: 'WARN', message: `WAF policy "${wafRef.name}" is attached to this load balancer but could not be retrieved, so its configuration was not audited.`,
+            remediation: 'Ensure the WAF policy namespace is included in the audit, or verify the policy (blocking mode, signatures, tuning) directly in the console.',
+          });
         }
       }
 
@@ -228,7 +273,7 @@ export class AuditEngine {
         if (!resolved) continue;
         usedSP.add(resolved.key);
         const name = (getMetadata(resolved.obj).name as string) || ref.name;
-        for (const rule of spRules) addFinding(rule, resolved.obj, lbNs, 'service_policy', name, lbName);
+        for (const rule of spRules) addFinding(rule, resolved.obj, lbNs, 'service_policy', name, lbName, resolved.key);
       }
 
       // Custom certificates referenced by this LB
@@ -237,7 +282,7 @@ export class AuditEngine {
         if (!resolved) continue;
         usedCert.add(resolved.key);
         const name = (getMetadata(resolved.obj).name as string) || ref.name;
-        for (const rule of certRules) addFinding(rule, resolved.obj, lbNs, 'certificate', name, lbName);
+        for (const rule of certRules) addFinding(rule, resolved.obj, lbNs, 'certificate', name, lbName, resolved.key);
       }
 
       lbIndex++;
@@ -254,9 +299,9 @@ export class AuditEngine {
     // Note: objects NOT referenced by any load balancer are intentionally not
     // reported — the audit covers each LB and its attached child objects only.
 
-    // Tenant-wide checks (SIEM, alerting) — run once, not per LB
+    // Tenant-wide checks (SIEM, alerting, IAM, DNS) — run once, not per LB
     for (const rule of tenantRules) {
-      addFinding(rule, {}, 'tenant-wide', 'http_loadbalancer', 'Tenant Configuration', '(tenant-wide)');
+      addFinding(rule, {}, 'tenant-wide', 'tenant', 'Tenant Configuration', '(tenant-wide)', `tenant/${rule.id}`);
     }
 
     // PHASE 3: Generate report
@@ -282,6 +327,7 @@ export class AuditEngine {
   // ─────────────────────────────────────────────────────────────────────────
 
   private async fetchAllConfigs(namespaces: string[]): Promise<AuditContext> {
+    this.fetchErrors = [];
     const configs: AuditContext['configs'] = {
       httpLoadBalancers: new Map(),
       originPools: new Map(),
@@ -390,6 +436,29 @@ export class AuditEngine {
       }
     }
 
+    // Dark-spot fix: LBs frequently reference WAF policies / certs / pools / service-policies that live
+    // in the `shared` (and sometimes `system`) namespace. Fetch those SUPPORTING object types from
+    // shared/system too (deduped into the same maps) so their rules actually run instead of silently
+    // going dark. We do NOT audit load balancers there — only resolve referenced dependencies.
+    for (const supportNs of ['shared', 'system']) {
+      if (namespaces.includes(supportNs) || this.aborted) continue;
+      const support = await Promise.allSettled([
+        this.fetchAppFirewalls(supportNs),
+        this.fetchOriginPools(supportNs),
+        this.fetchCertificates(supportNs),
+        this.fetchServicePolicies(supportNs),
+        this.fetchHealthChecks(supportNs),
+      ]);
+      const merge = (r: PromiseSettledResult<Map<string, unknown>>, into: Map<string, unknown>) => {
+        if (r.status === 'fulfilled') for (const [k, v] of r.value) if (!into.has(k)) { into.set(k, v); totalFetched++; }
+      };
+      merge(support[0], configs.appFirewalls);
+      merge(support[1], configs.originPools);
+      merge(support[2], configs.certificates);
+      merge(support[3], configs.servicePolicies);
+      merge(support[4], configs.healthChecks);
+    }
+
     // Fetch global objects (shared namespace)
     try {
       const glrMap = await this.fetchGlobalLogReceivers();
@@ -415,6 +484,7 @@ export class AuditEngine {
     // Build context with helper methods
     const context: AuditContext = {
       tenant: apiClient.getTenant() || '',
+      fetchErrors: this.fetchErrors,
       configs,
       getOriginPool: (ns, name) => configs.originPools.get(`${ns}/${name}`),
       getAppFirewall: (ns, name) => configs.appFirewalls.get(`${ns}/${name}`),
@@ -443,11 +513,14 @@ export class AuditEngine {
           const full = await apiClient.getLoadBalancer(namespace, name);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
       console.warn(`Failed to fetch load balancers from ${namespace}:`, e);
+      // FATAL: the namespace's LB list could not be read → nothing in it was audited. Record so the
+      // report/UI shows this scope as incomplete instead of silently scoring it clean.
+      this.fetchErrors.push({ namespace, objectType: 'namespace', message: (e as Error).message || String(e), fatal: true });
     }
     return result;
   }
@@ -466,7 +539,7 @@ export class AuditEngine {
           const full = await apiClient.getOriginPool(namespace, name);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -489,7 +562,7 @@ export class AuditEngine {
           const full = await apiClient.get(`/api/config/namespaces/${namespace}/app_firewalls/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -512,7 +585,7 @@ export class AuditEngine {
           const full = await apiClient.get(`/api/config/namespaces/${namespace}/healthchecks/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -535,7 +608,7 @@ export class AuditEngine {
           const full = await apiClient.getServicePolicy(namespace, name);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -556,7 +629,7 @@ export class AuditEngine {
           const full = await apiClient.getAlertPolicy(namespace, name);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -577,7 +650,7 @@ export class AuditEngine {
           const full = await apiClient.getAlertReceiver(namespace, name);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -600,7 +673,7 @@ export class AuditEngine {
           const full = await apiClient.get(`/api/config/namespaces/${namespace}/user_identifications/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -623,7 +696,7 @@ export class AuditEngine {
           const full = await apiClient.get(`/api/config/namespaces/${namespace}/certificates/${name}`);
           result.set(`${namespace}/${name}`, full);
         } catch {
-          result.set(`${namespace}/${name}`, item);
+          result.set(`${namespace}/${name}`, { ...(item as Record<string, unknown>), __partial: true });
         }
       }
     } catch (e) {
@@ -808,7 +881,7 @@ export class AuditEngine {
     // Severity-weighted security score (0-100). A failed CRITICAL check costs
     // far more than a low-severity warning; WARN gets half credit, FAIL zero.
     // SKIP/ERROR are excluded. Applied consistently to overall + every scope.
-    const score = weightedScore(findings);
+    const { score, scoredCount } = weightedScore(findings);
 
     // Entitlement breakdown of FAILED checks — tells the customer how many gaps
     // are config fixes vs. require a licensed add-on.
@@ -863,10 +936,10 @@ export class AuditEngine {
     }
     for (const ns of nsMap.values()) {
       ns.loadBalancers = nsLbs.get(ns.namespace)?.size ?? 0;
-      ns.score = weightedScore(nsFindings.get(ns.namespace) || []);
+      ns.score = weightedScore(nsFindings.get(ns.namespace) || []).score;
     }
     for (const lb of lbMap.values()) {
-      lb.score = weightedScore(lbFindingsByKey.get(`${lb.namespace}|${lb.loadBalancer}`) || []);
+      lb.score = weightedScore(lbFindingsByKey.get(`${lb.namespace}|${lb.loadBalancer}`) || []).score;
     }
 
     const namespaceSummary = [...nsMap.values()].sort((a, b) => a.namespace.localeCompare(b.namespace));
@@ -896,6 +969,8 @@ export class AuditEngine {
       durationMs: Date.now() - startTime,
       summary,
       score,
+      scoredCount,
+      fetchErrors: context.fetchErrors,
       findings: reportFindings.sort((a, b) => {
         // Sort by severity (CRITICAL first), then by status (FAIL first)
         const severityOrder: Record<Severity, number> = {

@@ -30,10 +30,12 @@ export { exportAnalysisCSV, exportExclusionJSON } from './report-generator';
 export { analysisLogger, AnalysisLogger, anonIP, anonUser, anonUA, anonDomain, sanitizePath } from './analysis-logger';
 export type { LogEntry, LogLevel } from './analysis-logger';
 export { classifyMatchingInfo } from './matching-info-analyzer';
-export { generateFPAnalysisPDF } from './fp-report-pdf';
-export type { FPReportOptions } from './fp-report-pdf';
+// PDF report removed — Excel is the sole report format.
 export { generateFPAnalysisExcel } from './fp-report-excel';
 export type { FPExcelReportOptions } from './fp-report-excel';
+export { computeEnforcementComparison } from './enforcement-comparison';
+export type { ComparisonEvent, ComparisonSignatureRef, SignatureMeta } from './enforcement-comparison';
+// Blocking-Mode Comparison is now folded into the main PDF/Excel — the standalone report module was removed.
 export type { MatchingInfoClassification, MatchingInfoResult } from './matching-info-analyzer';
 export { AdaptiveConcurrencyController } from './adaptive-concurrency';
 export type { AdaptiveConcurrencyConfig, RateLimitState } from './adaptive-concurrency';
