@@ -7,6 +7,13 @@ node_modules/
 dist/
 build/
 .vite/
+*.tsbuildinfo
+
+# Archives / snapshots — should not be committed
+*.zip
+
+# Generated report artifacts
+docs/*.pdf
 
 # Environment files
 .env
