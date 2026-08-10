@@ -331,6 +331,12 @@ export class ProgressiveAnalysisJob {
 
   private get vhName(): string { return `ves-io-http-loadbalancer-${this.config.lbName}`; }
 
+  private get domainFilter(): string {
+    if (!this.config.domains || this.config.domains.length === 0) return '';
+    if (this.config.domains.length === 1) return `, req_host="${this.config.domains[0]}"`;
+    return `, req_host=~"${this.config.domains.join('|')}"`;
+  }
+
   // ── Phase 1: collect WAF events ──
   // Fetch WAF events with malicious bots EXCLUDED at the source (server-side filter, when supported)
   // so the raw download stays small. Malicious bots are always req_risk High true positives, so the
@@ -364,7 +370,7 @@ export class ProgressiveAnalysisJob {
   }
 
   private async collectWafEvents(): Promise<RawEvent[]> {
-    const baseSelector = `vh_name="${this.vhName}", sec_event_name="WAF"`;
+    const baseSelector = `vh_name="${this.vhName}", sec_event_name="WAF"${this.domainFilter}`;
     await this.probeBotFilter(baseSelector);
     // Exclude malicious bots at the source when the filter is supported — keeps the raw download small.
     const query = this.serverBotFilterUsed ? `{${baseSelector}, ${MALICIOUS_BOT_EXCLUDE}}` : `{${baseSelector}}`;
@@ -443,7 +449,7 @@ export class ProgressiveAnalysisJob {
    * The classification distribution = exact malicious total + the non-malicious bots from the main pull.
    */
   private async collectMaliciousBotAggregates(): Promise<void> {
-    const malQuery = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_SELECTOR}}`;
+    const malQuery = `{vh_name="${this.vhName}", sec_event_name="WAF"${this.domainFilter}, ${MALICIOUS_BOT_SELECTOR}}`;
     const empty: Array<{ key: string; count: number }> = [];
     const [aggIp, aggPath, aggCountry, aggAsOrg, aggAction, aggReqRisk, aggReco, aggUa, aggName, aggType, aggDetect] =
       this.maliciousBotCount > 0
@@ -524,7 +530,7 @@ export class ProgressiveAnalysisJob {
   /** Bounded raw pull of malicious-bot rows for the breakdown detail only (capped so a scanned LB
    *  can't bloat collection). The exact count already came from total_hits in the probe. */
   private async pullMaliciousBotSample(): Promise<RawEvent[]> {
-    const query = `{vh_name="${this.vhName}", sec_event_name="WAF", ${MALICIOUS_BOT_SELECTOR}}`;
+    const query = `{vh_name="${this.vhName}", sec_event_name="WAF"${this.domainFilter}, ${MALICIOUS_BOT_SELECTOR}}`;
     const out: RawEvent[] = [];
     try {
       const initial = await this.api.fetchSecurityEventsPage(this.config.namespace, query, this.startTime, this.endTime, PAGE_SIZE);
@@ -610,8 +616,8 @@ export class ProgressiveAnalysisJob {
       if (this.cancelled) return;
       const ipRegex = batch.map(ip => ip.replace(/\./g, '\\.')).join('|');
       const query = batch.length === 1
-        ? `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}", src_ip="${batch[0]}"}`
-        : `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}", src_ip=~"${ipRegex}"}`;
+        ? `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}"${this.domainFilter}, src_ip="${batch[0]}"}`
+        : `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}"${this.domainFilter}, src_ip=~"${ipRegex}"}`;
 
       const tasks = chunks.map((chunk, idx) => ({
         id: idx,
@@ -704,7 +710,7 @@ export class ProgressiveAnalysisJob {
     for (const batch of batches) {
       if (this.cancelled) return;
       const regex = batch.map(p => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('|');
-      const query = `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}", req_path=~"${regex}"}`;
+      const query = `{vh_name="ves-io-http-loadbalancer-${this.config.lbName}"${this.domainFilter}, req_path=~"${regex}"}`;
       const tasks = chunks.map((chunk, idx) => ({
         id: idx,
         execute: async (): Promise<number> => {

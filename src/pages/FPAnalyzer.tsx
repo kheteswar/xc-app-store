@@ -1030,6 +1030,7 @@ export default function FPAnalyzer() {
   const [loadBalancers, setLoadBalancers] = useState<LoadBalancer[]>([]);
   const [selectedLb, setSelectedLb] = useState('');
   const [domains, setDomains] = useState<string[]>([]);
+  const [selectedDomains, setSelectedDomains] = useState<string[]>([]);
 
   // ── Analysis config ──
   const [hoursBack, setHoursBack] = useState(168);
@@ -1104,9 +1105,22 @@ export default function FPAnalyzer() {
 
   // ── Update domains when LB changes ──
   useEffect(() => {
-    const lb = loadBalancers.find(l => l.name === selectedLb);
-    setDomains(lb?.spec?.domains || []);
-  }, [selectedLb, loadBalancers]);
+    if (!selectedNs || !selectedLb) {
+      setDomains([]);
+      setSelectedDomains([]);
+      return;
+    }
+    
+    // The list API only returns metadata stubs. We must fetch the full LB to get the spec.domains.
+    apiClient.getLoadBalancer(selectedNs, selectedLb).then((fullLb) => {
+      const doms = fullLb?.spec?.domains || [];
+      setDomains(doms);
+      setSelectedDomains(doms); // By default, select all domains
+    }).catch(() => {
+      setDomains([]);
+      setSelectedDomains([]);
+    });
+  }, [selectedNs, selectedLb]);
 
   // ── Toggle scope ──
   const toggleScope = (scope: AnalysisScope) => {
@@ -1123,8 +1137,8 @@ export default function FPAnalyzer() {
   // ═══════════════════════════════════════════════════════════════
 
   const startAnalysis = useCallback(async () => {
-    if (!selectedNs || !selectedLb) {
-      toast.error('Select a namespace and load balancer');
+    if (!selectedNs || !selectedLb || (domains.length > 0 && selectedDomains.length === 0)) {
+      toast.error('Select a namespace, load balancer, and at least one domain');
       return;
     }
 
@@ -1153,7 +1167,7 @@ export default function FPAnalyzer() {
           token,
           namespace: selectedNs,
           lbName: selectedLb,
-          domains,
+          domains: selectedDomains,
           scopes,
           hoursBack,
         }),
@@ -1197,7 +1211,7 @@ export default function FPAnalyzer() {
       toast.error(err instanceof Error ? err.message : 'Failed to start analysis');
       setPhase('idle');
     }
-  }, [selectedNs, selectedLb, tenant, domains, scopes, hoursBack, toast]);
+  }, [selectedNs, selectedLb, selectedDomains, tenant, scopes, hoursBack, toast]);
 
   // ═══════════════════════════════════════════════════════════════
   // SELECT SIGNATURE → LOAD DETAIL
@@ -1587,6 +1601,28 @@ export default function FPAnalyzer() {
           </div>
         </div>
 
+        {/* Domain Selection */}
+        {domains.length > 0 && (
+          <div className="mb-4">
+            <label className="block text-xs text-slate-400 mb-1">Domains</label>
+            <div className="flex flex-wrap gap-2">
+              {domains.map(d => {
+                const isSelected = selectedDomains.includes(d);
+                return (
+                  <button key={d} onClick={() => {
+                    setSelectedDomains(prev => isSelected ? prev.filter(x => x !== d) : [...prev, d]);
+                  }} disabled={phase !== 'idle'}
+                    className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${isSelected
+                      ? 'bg-blue-600/30 border-blue-500 text-blue-300'
+                      : 'bg-slate-800 border-slate-600 text-slate-400 hover:border-slate-500'}`}
+                  >{d}</button>
+                );
+              })}
+            </div>
+            {selectedDomains.length === 0 && <span className="text-xs text-red-400 mt-1 block">Select at least one domain</span>}
+          </div>
+        )}
+
         {/* Time range */}
         <div className="mb-4">
           <label className="block text-xs text-slate-400 mb-1">Time Range</label>
@@ -1620,7 +1656,7 @@ export default function FPAnalyzer() {
         </div>
 
         {/* Start button */}
-        <button onClick={startAnalysis} disabled={phase !== 'idle' || !selectedNs || !selectedLb}
+        <button onClick={startAnalysis} disabled={phase !== 'idle' || !selectedNs || !selectedLb || (domains.length > 0 && selectedDomains.length === 0)}
           className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-600 disabled:text-slate-400 text-white rounded-lg font-medium text-sm transition-colors flex items-center justify-center gap-2"
         >
           <Play className="w-4 h-4" /> Start Progressive Analysis
