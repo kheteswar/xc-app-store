@@ -17,7 +17,7 @@ import { apiClient } from '../services/api';
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD';
 type TestMode = 'duration' | 'count';
-type LoadProfile = 'constant' | 'ramp' | 'step' | 'spike';
+type LoadProfile = 'constant' | 'ramp' | 'step' | 'spike' | 'burst';
 type ChartTab = 'response' | 'throughput' | 'histogram';
 
 interface ThresholdRule { metric: string; op: string; value: number }
@@ -42,6 +42,7 @@ const PROFILES: { id: LoadProfile; label: string; desc: string }[] = [
   { id: 'ramp', label: 'Ramp', desc: 'Linear ramp-up' },
   { id: 'step', label: 'Step', desc: 'Staircase increase' },
   { id: 'spike', label: 'Spike', desc: 'Burst traffic' },
+  { id: 'burst', label: 'Burst', desc: 'Fire N requests simultaneously every interval to hit an exact RPS' },
 ];
 const THRESHOLD_METRICS = [
   { id: 'avg_response', label: 'Avg Response (ms)' },
@@ -82,7 +83,7 @@ export default function LoadTester() {
   const [testMode, setTestMode] = useState<TestMode>('duration');
   const [duration, setDuration] = useState(10);
   const [totalRequests, setTotalRequests] = useState(100);
-  const [concurrency, setConcurrency] = useState(10);
+  const [concurrency, setConcurrency] = useState(50);
   const [showConfig, setShowConfig] = useState(false);
 
   // Load profile
@@ -95,6 +96,9 @@ export default function LoadTester() {
   const [spikePeak, setSpikePeak] = useState(100);
   const [spikeAt, setSpikeAt] = useState(50);
   const [spikeDur, setSpikeDur] = useState(10);
+  // Burst: fire `burstSize` requests all at once, every `burstInterval` seconds → RPS = burstSize / burstInterval
+  const [burstSize, setBurstSize] = useState(50);
+  const [burstInterval, setBurstInterval] = useState(1);
 
   // Thresholds & Apdex
   const [thresholds, setThresholds] = useState<ThresholdRule[]>([]);
@@ -128,6 +132,7 @@ export default function LoadTester() {
   const startTimeRef = useRef(0);
   const dispatchRef = useRef<ReturnType<typeof setInterval>>();
   const uiRef = useRef<ReturnType<typeof setInterval>>();
+  const burstsDoneRef = useRef(0);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -157,9 +162,10 @@ export default function LoadTester() {
         if (t >= spikeStartT && t <= spikeEndT) return spikePeak;
         return spikeBase;
       }
+      case 'burst': return burstSize / Math.max(1, burstInterval); // effective (average) RPS
       default: return rps;
     }
-  }, [profile, rps, rampFrom, rampTo, stepSize, stepInterval, spikeBase, spikePeak, spikeAt, spikeDur, duration]);
+  }, [profile, rps, rampFrom, rampTo, stepSize, stepInterval, spikeBase, spikePeak, spikeAt, spikeDur, duration, burstSize, burstInterval]);
 
   const getExpectedAt = useCallback((ms: number): number => {
     let total = 0;
@@ -337,6 +343,7 @@ export default function LoadTester() {
     resultsRef.current = [];
     sentRef.current = 0;
     inFlightRef.current = 0;
+    burstsDoneRef.current = 0;
     abortRef.current = false;
     startTimeRef.current = Date.now();
     setResults([]);
@@ -410,15 +417,30 @@ export default function LoadTester() {
         return;
       }
 
-      // Calculate how many requests should have been sent by now
-      const expected = Math.min(
-        profile === 'constant' ? Math.floor(elapsed * rps / 1000) : getExpectedAt(elapsed),
-        targetTotal
-      );
-      const toSend = expected - sentRef.current;
-      for (let i = 0; i < toSend && inFlightRef.current < concurrency; i++) {
-        sentRef.current++;
-        sendOne();
+      if (profile === 'burst') {
+        // Fire `burstSize` requests simultaneously at each interval boundary (t=0, T, 2T…).
+        // Synchronous loop => all fetches are initiated in the same event-loop tick, i.e. truly
+        // at once. Concurrency cap is intentionally bypassed — the burst IS the concurrency.
+        const intervalMs = Math.max(1, burstInterval) * 1000;
+        const dueBursts = Math.floor(elapsed / intervalMs) + 1;
+        while (burstsDoneRef.current < dueBursts && sentRef.current < targetTotal) {
+          for (let i = 0; i < burstSize && sentRef.current < targetTotal; i++) {
+            sentRef.current++;
+            sendOne();
+          }
+          burstsDoneRef.current++;
+        }
+      } else {
+        // Calculate how many requests should have been sent by now
+        const expected = Math.min(
+          profile === 'constant' ? Math.floor(elapsed * rps / 1000) : getExpectedAt(elapsed),
+          targetTotal
+        );
+        const toSend = expected - sentRef.current;
+        for (let i = 0; i < toSend && inFlightRef.current < concurrency; i++) {
+          sentRef.current++;
+          sendOne();
+        }
       }
     }, 50);
 
@@ -429,7 +451,7 @@ export default function LoadTester() {
       setSentCount(sentRef.current);
     }, 200);
 
-  }, [url, method, customHeaders, requestBody, rps, testMode, duration, totalRequests, concurrency, profile, getExpectedAt]);
+  }, [url, method, customHeaders, requestBody, rps, testMode, duration, totalRequests, concurrency, profile, getExpectedAt, burstSize, burstInterval]);
 
   const stopTest = useCallback(() => {
     abortRef.current = true;
@@ -787,6 +809,15 @@ export default function LoadTester() {
                 <span className="text-slate-500 text-xs">%</span>
               </div>
             )}
+            {profile === 'burst' && (
+              <div className="flex items-center gap-1.5">
+                <label className="text-slate-400">Requests:</label>
+                <input type="number" value={burstSize} onChange={(e) => setBurstSize(Math.max(1, parseInt(e.target.value) || 1))} disabled={isRunning} className={`w-20 ${NI}`} min={1} max={5000} title="Number of requests fired simultaneously in each burst" />
+                <label className="text-slate-400">every</label>
+                <input type="number" value={burstInterval} onChange={(e) => setBurstInterval(Math.max(1, parseInt(e.target.value) || 1))} disabled={isRunning} className={`w-14 ${NI}`} min={1} />
+                <span className="text-slate-500 text-xs">sec → ~{Math.round(burstSize / Math.max(1, burstInterval))} RPS</span>
+              </div>
+            )}
 
             <div className="w-px h-6 bg-slate-600" />
 
@@ -812,7 +843,20 @@ export default function LoadTester() {
 
             <div className="flex items-center gap-2">
               <label className="text-slate-400">Concurrency:</label>
-              <input type="number" value={concurrency} onChange={(e) => setConcurrency(Math.max(1, parseInt(e.target.value) || 1))} disabled={isRunning} className={`w-16 ${NI}`} min={1} max={500} />
+              <input
+                type="number"
+                value={profile === 'burst' ? burstSize : concurrency}
+                onChange={(e) => setConcurrency(Math.max(1, parseInt(e.target.value) || 1))}
+                disabled={isRunning || profile === 'burst'}
+                className={`w-20 ${NI} ${profile === 'burst' ? 'opacity-40' : ''}`}
+                min={1} max={2000}
+                title="Max requests allowed in-flight at once. If it's lower than your target RPS and the endpoint is slow, it caps the achievable RPS. Use the Burst profile to fire N requests simultaneously regardless of this cap."
+              />
+              {profile === 'burst'
+                ? <span className="text-[10px] text-slate-500">= burst size (all fire at once)</span>
+                : profile === 'constant' && concurrency < rps
+                  ? <span className="text-[10px] text-amber-400">⚠ below target {rps} RPS — may cap throughput</span>
+                  : null}
             </div>
 
             <div className="flex-1" />
@@ -926,7 +970,7 @@ export default function LoadTester() {
               { label: 'Errors', value: stats.clientErrors + stats.serverErrors + stats.networkErrors, sub: `${stats.clientErrors} 4xx · ${stats.serverErrors} 5xx · ${stats.networkErrors} net`, color: 'text-red-400' },
               { label: 'Avg Response', value: `${Math.round(stats.avg)}ms`, sub: `min ${Math.round(stats.min)}ms`, color: 'text-blue-400' },
               { label: 'P95 Response', value: `${Math.round(stats.p95)}ms`, sub: `max ${Math.round(stats.max)}ms`, color: 'text-amber-400' },
-              { label: 'Actual RPS', value: stats.currentRps.toFixed(1), sub: `target ${profile === 'constant' ? `${rps}/s` : profile}`, color: 'text-purple-400' },
+              { label: 'Actual RPS', value: stats.currentRps.toFixed(1), sub: `target ${profile === 'constant' ? `${rps}/s` : profile === 'burst' ? `${burstSize}×/${burstInterval}s` : profile}`, color: 'text-purple-400' },
             ].map((card, i) => (
               <div key={i} className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4">
                 <p className="text-xs text-slate-500 mb-1">{card.label}</p>

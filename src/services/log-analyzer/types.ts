@@ -4,7 +4,7 @@ import type { AccessLogEntry, SecurityEventEntry } from '../rate-limit-advisor/t
 // TIME & QUERY
 // ═══════════════════════════════════════════════════════════════════
 
-export type TimePeriod = '5m' | '15m' | '1h' | '6h' | '24h' | '7d' | '14d';
+export type TimePeriod = '5m' | '15m' | '1h' | '6h' | '24h' | '7d' | '14d' | '30d';
 export type LogSource = 'access' | 'security' | 'both';
 
 export const TIME_PERIOD_HOURS: Record<TimePeriod, number> = {
@@ -15,6 +15,7 @@ export const TIME_PERIOD_HOURS: Record<TimePeriod, number> = {
   '24h': 24,
   '7d': 168,
   '14d': 336,
+  '30d': 720,
 };
 
 export const TIME_PERIOD_LABELS: Record<TimePeriod, string> = {
@@ -25,6 +26,7 @@ export const TIME_PERIOD_LABELS: Record<TimePeriod, string> = {
   '24h': 'Last 24 Hours',
   '7d': 'Last 7 Days',
   '14d': 'Last 14 Days',
+  '30d': 'Last 30 Days',
 };
 
 export interface QueryFilter {
@@ -223,4 +225,24 @@ export interface AggregatedLogData {
   timeSeries: Array<{ timestamp: string; count: number; label: string }>;
   /** Total security events (from probe) */
   totalSecurityEvents: number;
+
+  // ── Context for on-demand aggregation fetches ─────────────────
+  /** Namespace the analysis was run against */
+  namespace: string;
+  /** VoltVQL query string used for the analysis */
+  query: string;
+  /** ISO8601 window start */
+  startTime: string;
+  /** ISO8601 window end */
+  endTime: string;
+
+  // ── Metrics API summary (for 14d/30d windows beyond access-log retention) ──
+  /**
+   * When window > 7d, we also fetch pre-aggregated metrics from `graph/service`
+   * (same source as F5 XC Console's Performance dashboard). Non-null when the
+   * hybrid metrics path was used.
+   */
+  metricsSummary?: import('./metrics-client').MetricSummary | null;
+  /** True if this analysis window exceeds access-log retention and field breakdowns are limited. */
+  metricsPathActive?: boolean;
 }

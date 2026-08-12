@@ -16,7 +16,15 @@ interface TestRow {
   domain: string;
   targetIps: string[];
   path: string;
+  method: string;
 }
+
+const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+// Normalize a method token from input → a valid uppercase method; default GET.
+const normalizeMethod = (m?: string): string => {
+  const v = (m || '').trim().toUpperCase();
+  return HTTP_METHODS.has(v) ? v : 'GET';
+};
 
 interface TlsCertInfo {
   subject: string;
@@ -162,6 +170,8 @@ const parseCSV = (text: string): TestRow[] => {
       domain: cols[0] || '',
       targetIps: cols[1] ? cols[1].split(';').map(ip => ip.trim()).filter(Boolean) : [],
       path: cols[2] || '/',
+      // Optional 4th column "method"; default GET when absent/invalid.
+      method: normalizeMethod(cols[3]),
     };
   }).filter(r => r.domain && r.path);
 };
@@ -180,6 +190,7 @@ const parseUrlEntries = (entries: UrlEntry[], spoofIps: string[]): TestRow[] => 
           domain: parsed.hostname,
           targetIps: validIps,
           path: parsed.pathname + parsed.search,
+          method: 'GET',
         };
       } catch {
         return null;
@@ -279,26 +290,36 @@ const ComparisonTable = ({ publicRes, spoofedResults }: { publicRes: RequestResu
   );
 };
 
-const DiffView = ({ left, right, title }: { left: string, right: string, title: string }) => (
-  <div className="grid grid-cols-2 gap-4 text-xs font-mono">
-    <div className="bg-slate-900/50 p-2 rounded border border-slate-700/50 overflow-auto max-h-64">
-      <div className="text-slate-500 mb-1 border-b border-slate-700 pb-1">Public {title}</div>
-      <pre className="whitespace-pre-wrap break-all text-slate-300">{left || '<empty>'}</pre>
+// Multi-column body comparison: LIVE + every spoofed source side by side.
+const BodyCompare = ({ publicRes, spoofedResults, chars = 500 }: { publicRes: RequestResult, spoofedResults: SpoofedResult[], chars?: number }) => {
+  const cols = [
+    { label: 'LIVE', color: 'text-blue-400', dot: 'bg-blue-400', body: publicRes.normalizedBody },
+    ...spoofedResults.map((s, i) => ({ label: getSpoofLabel(i), color: getSpoofColor(i).label, dot: getSpoofColor(i).dot, body: s.result.normalizedBody })),
+  ];
+  return (
+    <div className="grid gap-3 text-xs font-mono" style={{ gridTemplateColumns: `repeat(${cols.length}, minmax(0, 1fr))` }}>
+      {cols.map((col, ci) => (
+        <div key={ci} className="bg-slate-900/50 p-2 rounded border border-slate-700/50 overflow-auto max-h-64">
+          <div className={`mb-1 border-b border-slate-700 pb-1 flex items-center gap-1.5 ${col.color}`}>
+            <div className={`w-1.5 h-1.5 rounded-full ${col.dot}`} />{col.label}
+          </div>
+          <pre className="whitespace-pre-wrap break-all text-slate-300">{(col.body || '').slice(0, chars) || '<empty>'}</pre>
+        </div>
+      ))}
     </div>
-    <div className="bg-slate-900/50 p-2 rounded border border-slate-700/50 overflow-auto max-h-64">
-      <div className="text-slate-500 mb-1 border-b border-slate-700 pb-1">Spoofed {title}</div>
-      <pre className="whitespace-pre-wrap break-all text-slate-300">{right || '<empty>'}</pre>
-    </div>
-  </div>
-);
+  );
+};
 
-const HeaderDiff = ({ pubHeaders, spoofHeaders, publicIp, spoofedIp }: { 
-  pubHeaders: Record<string, string>, 
-  spoofHeaders: Record<string, string>,
-  publicIp?: string,
-  spoofedIp?: string
-}) => {
-  const allKeys = new Set([...Object.keys(pubHeaders), ...Object.keys(spoofHeaders)]);
+// Single multi-column header table: LIVE + every spoofed source side by side.
+// A cell is highlighted when it differs from LIVE for a non-ignored header.
+const HeaderDiff = ({ publicRes, spoofedResults }: { publicRes: RequestResult, spoofedResults: SpoofedResult[] }) => {
+  const cols = [
+    { label: 'LIVE', labelColor: 'text-blue-400', dot: 'bg-blue-400', headers: publicRes.headers, ip: publicRes.connectedIp },
+    ...spoofedResults.map((s, i) => ({ label: getSpoofLabel(i), labelColor: getSpoofColor(i).label, dot: getSpoofColor(i).dot, headers: s.result.headers, ip: s.result.connectedIp })),
+  ];
+  const liveHeaders = publicRes.headers;
+  const allKeys = new Set<string>();
+  cols.forEach(c => Object.keys(c.headers).forEach(k => allKeys.add(k)));
   const sortedKeys = Array.from(allKeys).sort();
 
   return (
@@ -306,49 +327,41 @@ const HeaderDiff = ({ pubHeaders, spoofHeaders, publicIp, spoofedIp }: {
       <table className="w-full text-left border-collapse">
         <thead className="bg-slate-800 sticky top-0 z-10">
           <tr>
-            <th className="p-2 border-b border-slate-700 w-1/3">Header</th>
-            <th className="p-2 border-b border-slate-700 w-1/3">
-              <div>Public</div>
-              {publicIp && <div className="text-[10px] text-blue-400 font-normal">IP: {publicIp}</div>}
-            </th>
-            <th className="p-2 border-b border-slate-700 w-1/3">
-              <div>Spoofed</div>
-              {spoofedIp && <div className="text-[10px] text-emerald-400 font-normal">IP: {spoofedIp}</div>}
-            </th>
+            <th className="p-2 border-b border-slate-700">Header</th>
+            {cols.map((col, ci) => (
+              <th key={ci} className={`p-2 border-b border-slate-700 ${col.labelColor}`}>
+                <div className="flex items-center gap-1.5"><div className={`w-1.5 h-1.5 rounded-full ${col.dot}`} />{col.label}</div>
+                {col.ip && <div className="text-[10px] text-slate-500 font-normal truncate max-w-[140px]" title={col.ip}>{col.ip}</div>}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
           {sortedKeys.map(key => {
             const isIgnored = IGNORED_HEADERS.has(key);
-            const valPub = pubHeaders[key];
-            const valSpoof = spoofHeaders[key];
-            const isDiff = valPub !== valSpoof;
-            const isSignificantDiff = isDiff && !isIgnored;
-            
+            const liveVal = liveHeaders[key];
+            const anyDiff = !isIgnored && cols.slice(1).some(c => c.headers[key] !== liveVal);
+
             let rowClass = 'border-b border-slate-800 hover:bg-slate-800/50';
             let headerClass = 'p-2 truncate';
-            
-            if (isSignificantDiff) {
-              rowClass += ' bg-amber-900/10';
-              headerClass += ' text-amber-400 font-bold';
-            } else if (isIgnored) {
-              headerClass += ' text-slate-600';
-            } else {
-              headerClass += ' text-slate-400';
-            }
+            if (anyDiff) { rowClass += ' bg-amber-900/10'; headerClass += ' text-amber-400 font-bold'; }
+            else if (isIgnored) headerClass += ' text-slate-600';
+            else headerClass += ' text-slate-400';
 
             return (
               <tr key={key} className={rowClass}>
                 <td className={headerClass}>
-                  {key}
-                  {isIgnored && <span className="ml-1 text-slate-700 text-[10px]">(ignored)</span>}
+                  {key}{isIgnored && <span className="ml-1 text-slate-700 text-[10px]">(ignored)</span>}
                 </td>
-                <td className="p-2 truncate max-w-xs text-slate-300" title={valPub}>
-                  {valPub || <span className="text-slate-600">-</span>}
-                </td>
-                <td className={`p-2 truncate max-w-xs ${isSignificantDiff ? 'text-amber-300 font-semibold' : 'text-slate-300'}`} title={valSpoof}>
-                  {valSpoof || <span className="text-slate-600">-</span>}
-                </td>
+                {cols.map((col, ci) => {
+                  const val = col.headers[key];
+                  const isDiffCell = ci > 0 && !isIgnored && val !== liveVal;
+                  return (
+                    <td key={ci} className={`p-2 truncate max-w-xs ${isDiffCell ? 'text-amber-300 font-semibold' : 'text-slate-300'}`} title={val}>
+                      {val || <span className="text-slate-600">-</span>}
+                    </td>
+                  );
+                })}
               </tr>
             );
           })}
@@ -478,7 +491,7 @@ export function HttpSanityChecker() {
   const updateSpoofIp = (i: number, val: string) => setSpoofIps(prev => prev.map((v, idx) => idx === i ? val : v));
   const [showBulkAdd, setShowBulkAdd] = useState(false);
   const [bulkText, setBulkText] = useState('');
-  const [csvText, setCsvText] = useState<string>('example.com, 1.2.3.4, /api/health');
+  const [csvText, setCsvText] = useState<string>('example.com, 1.2.3.4, /api/health, GET');
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState<ComparisonResult[]>([]);
@@ -486,7 +499,7 @@ export function HttpSanityChecker() {
   const abortController = useRef<AbortController | null>(null);
 
   // --- Server-Side Proxy Execution ---
-  const executeRequest = async (url: string, isSpoofed: boolean, hostHeader: string, targetIp: string): Promise<RequestResult> => {
+  const executeRequest = async (url: string, isSpoofed: boolean, hostHeader: string, targetIp: string, method: string = 'GET'): Promise<RequestResult> => {
     const start = performance.now();
     try {
       const headers: Record<string, string> = {
@@ -509,7 +522,7 @@ export function HttpSanityChecker() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url,
-          method: 'GET',
+          method,
           headers,
           targetIp: isSpoofed ? targetIp : undefined
         }),
@@ -657,13 +670,13 @@ export function HttpSanityChecker() {
         );
         const domain = parsed.hostname;
         const path = parsed.pathname + parsed.search || '/';
-        return [domain, validIps.join(';'), path].join(',');
+        return [domain, validIps.join(';'), path, 'GET'].join(',');
       } catch {
         return null;
       }
     }).filter(Boolean);
 
-    const content = ['Live Domain, Spoof IPs (;-sep), Path', ...rows].join('\n');
+    const content = ['Live Domain, Spoof IPs (;-sep), Path, Method', ...rows].join('\n');
     const blob = new Blob([content], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -720,8 +733,8 @@ export function HttpSanityChecker() {
       const publicUrl = `https://${row.domain}${row.path}`;
 
       const [publicRes, ...spoofResArray] = await Promise.all([
-        executeRequest(publicUrl, false, row.domain, ''),
-        ...row.targetIps.map(ip => executeRequest(publicUrl, true, row.domain, ip))
+        executeRequest(publicUrl, false, row.domain, '', row.method),
+        ...row.targetIps.map(ip => executeRequest(publicUrl, true, row.domain, ip, row.method))
       ]);
 
       const overallReasons: string[] = [];
@@ -767,7 +780,7 @@ export function HttpSanityChecker() {
   const handleExport = () => {
     if (results.length === 0) return;
     const header = [
-      "Live Domain", "Path", "Overall Result",
+      "Live Domain", "Path", "Method", "Overall Result",
       "Live Status", "Live ConnIP",
       ...results[0]?.spoofedResults.flatMap((_, i) => [
         `Spoof${i+1} IP`, `Spoof${i+1} Status`, `Spoof${i+1} StatusMatch`, `Spoof${i+1} Similarity`, `Spoof${i+1} Bot`
@@ -775,7 +788,7 @@ export function HttpSanityChecker() {
       "Drift Reasons"
     ];
     const csvRows = results.map(r => [
-      r.row.domain, r.row.path,
+      r.row.domain, r.row.path, r.row.method,
       r.overallPassed ? "PASS" : "FAIL",
       r.public.status, r.public.connectedIp || '',
       ...r.spoofedResults.flatMap(s => [
@@ -861,7 +874,7 @@ export function HttpSanityChecker() {
                   <>
                     <div className="flex justify-between items-center mb-2">
                       <label className="block text-xs font-mono text-slate-400">
-                        CSV Input: Live Domain, Spoof IP, Path
+                        CSV Input: Live Domain, Spoof IP, Path, Method (optional, default GET)
                       </label>
                       <div className="flex gap-2">
                         <button 
@@ -890,7 +903,7 @@ export function HttpSanityChecker() {
                       value={csvText}
                       onChange={(e) => setCsvText(e.target.value)}
                       className="w-full h-64 bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-blue-500 outline-none resize-none"
-                      placeholder="example.com, 1.2.3.4 (spoof IP), /api/status"
+                      placeholder="example.com, 1.2.3.4 (spoof IP), /api/status, GET"
                     />
                   </>
                 ) : (
@@ -1139,7 +1152,7 @@ export function HttpSanityChecker() {
                         className="bg-slate-900 border border-slate-600 rounded-lg px-2 py-1.5 text-xs text-slate-300 max-w-xs truncate">
                         {results.map((r, i) => (
                           <option key={r.row.id} value={i}>
-                            {r.overallPassed ? '\u2705' : '\u274C'} {r.row.domain}{r.row.path}
+                            {r.overallPassed ? '\u2705' : '\u274C'} [{r.row.method}] {r.row.domain}{r.row.path}
                           </option>
                         ))}
                       </select>
@@ -1163,13 +1176,15 @@ export function HttpSanityChecker() {
                               </span>
                               <Globe className="w-3.5 h-3.5 text-slate-500" />
                               <span className="text-sm font-semibold text-slate-200">{res.row.domain}</span>
+                              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30" title="Request method">{res.row.method}</span>
                             </div>
-                            <div className="flex items-center gap-2 mt-1.5">
-                              <code className="text-xs text-slate-400 bg-slate-900/60 border border-slate-700/60 rounded px-2 py-1 truncate max-w-md" title={fullUrl}>
+                            <div className="flex items-start gap-2 mt-1.5">
+                              <span className="text-[10px] font-bold uppercase text-slate-500 mt-1.5 shrink-0">{res.row.method}</span>
+                              <code className="flex-1 min-w-0 text-xs text-slate-300 bg-slate-900/60 border border-slate-700/60 rounded px-2 py-1 break-all" title={fullUrl}>
                                 {fullUrl}
                               </code>
                               <a href={fullUrl} target="_blank" rel="noopener noreferrer"
-                                className="shrink-0 text-slate-500 hover:text-blue-400 transition-colors">
+                                className="shrink-0 text-slate-500 hover:text-blue-400 transition-colors mt-1.5">
                                 <ExternalLink className="w-3.5 h-3.5" />
                               </a>
                             </div>
@@ -1245,22 +1260,7 @@ export function HttpSanityChecker() {
                             </div>
                           </div>
                         </div>
-                        {displayedSpoofs.map((spoof, si) => {
-                          const c = getSpoofColor(si);
-                          return (
-                            <div key={si} className="mb-3">
-                              <div className={`text-[10px] font-bold uppercase mb-1 ${c.label}`}>
-                                LIVE vs {getSpoofLabel(si)} ({spoof.ip})
-                              </div>
-                              <HeaderDiff
-                                pubHeaders={res.public.headers}
-                                spoofHeaders={spoof.result.headers}
-                                publicIp={res.public.connectedIp}
-                                spoofedIp={spoof.result.connectedIp}
-                              />
-                            </div>
-                          );
-                        })}
+                        <HeaderDiff publicRes={res.public} spoofedResults={displayedSpoofs} />
                       </div>
 
                       {/* TLS Certificate Comparison */}
@@ -1282,14 +1282,10 @@ export function HttpSanityChecker() {
                       {displayedSpoofs.length > 0 && (
                         <div className="px-5 pb-4">
                           <h4 className="text-xs font-bold text-slate-400 uppercase mb-2 flex items-center gap-2">
-                            <Code className="w-3 h-3" /> Body Preview (Live vs {getSpoofLabel(0)})
+                            <Code className="w-3 h-3" /> Body Preview
                           </h4>
                           <div className="text-xs font-bold text-slate-500 mb-1">Normalized Body Preview (First 500 chars)</div>
-                          <DiffView
-                            left={res.public.normalizedBody.slice(0, 500)}
-                            right={displayedSpoofs[0].result.normalizedBody.slice(0, 500)}
-                            title="Normalized Content"
-                          />
+                          <BodyCompare publicRes={res.public} spoofedResults={displayedSpoofs} />
                         </div>
                       )}
 

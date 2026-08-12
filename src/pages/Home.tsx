@@ -29,6 +29,7 @@ import {
   EyeOff,
   GitCompare,
   Swords,
+  Briefcase,
 } from 'lucide-react';
 import { ConnectionPanel } from '../components/ConnectionPanel';
 import { ToolCard } from '../components/ToolCard';
@@ -37,6 +38,19 @@ import { useApp } from '../context/AppContext';
 const PINNED_STORAGE_KEY = 'xc-app-store:pinned-tools';
 
 const tools = [
+  {
+    name: 'Work Manager',
+    description: 'Manage tasks, accounts and career artifacts from one GUI. Backed by your mywork/ markdown files — edit here or from Copilot chat, same source of truth.',
+    icon: Briefcase,
+    to: '/work-mgr',
+    tags: [
+      { label: 'Organize', type: 'report' as const },
+      { label: 'Local Files', type: 'safe' as const },
+    ],
+    badge: 'New',
+    featured: true,
+    standalone: true,
+  },
   {
     name: 'API Shield Advisor',
     description: 'Guided API security assessment. Scans your F5 XC config, discovers APIs, profiles traffic, and walks you through enabling 90+ security controls with data-driven recommendations.',
@@ -267,6 +281,19 @@ const tools = [
     description: 'Stress test any endpoint with configurable RPS, concurrency, and real-time response time metrics.',
     icon: Zap,
     to: '/load-tester',
+    tags: [
+      { label: 'Testing', type: 'update' as const },
+      { label: 'Standalone', type: 'safe' as const },
+    ],
+    badge: 'New',
+    featured: true,
+    standalone: true,
+  },
+  {
+    name: 'DDoS Tester',
+    description: 'Generate a demo origin app (PHP/Node/Python/Go) that stays healthy under a set RPS then simulates origin distress — 5xx + rising latency — above it. Fire traffic at low RPS to demo how F5 XC L7 DDoS detection & mitigation triggers.',
+    icon: Swords,
+    to: '/ddos-tester',
     tags: [
       { label: 'Testing', type: 'update' as const },
       { label: 'Standalone', type: 'safe' as const },

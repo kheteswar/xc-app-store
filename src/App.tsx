@@ -24,12 +24,14 @@ import { ConfigExplorer } from './pages/ConfigExplorer';
 import { DdosAdvisor } from './pages/DdosAdvisor';
 import { LogAnalyzer } from './pages/LogAnalyzer';
 import LoadTester from './pages/LoadTester';
+import { DdosTester } from './pages/DdosTester';
 import { SOCLobby } from './pages/SOCLobby';
 import { SOCRoom } from './pages/SOCRoom';
 import { APIShieldAdvisor } from './pages/APIShieldAdvisor';
 import { APIReport } from './pages/APIReport';
 import { Anonymizer } from './pages/Anonymizer';
 import { DiffChecker } from './pages/DiffChecker';
+import { WorkMgr } from './pages/WorkMgr';
 import {
   WAFScannerExplainer, SecurityAuditorExplainer, FPAnalyzerExplainer,
   DDoSAdvisorExplainer, ConfigViewerExplainer, ConfigComparatorExplainer,
@@ -70,12 +72,14 @@ function App() {
                 <Route path="/ddos-advisor" element={<DdosAdvisor />} />
                 <Route path="/log-analyzer" element={<LogAnalyzer />} />
                 <Route path="/load-tester" element={<LoadTester />} />
+                <Route path="/ddos-tester" element={<DdosTester />} />
                 <Route path="/soc-lobby" element={<SOCLobby />} />
                 <Route path="/soc-room/:roomId" element={<SOCRoom />} />
                 <Route path="/api-shield" element={<APIShieldAdvisor />} />
                 <Route path="/api-report" element={<APIReport />} />
                 <Route path="/anonymizer" element={<Anonymizer />} />
                 <Route path="/diff-checker" element={<DiffChecker />} />
+                <Route path="/work-mgr" element={<WorkMgr />} />
                 {/* Tool Explainer Pages */}
                 <Route path="/explainer/waf-scanner" element={<WAFScannerExplainer />} />
                 <Route path="/explainer/security-auditor" element={<SecurityAuditorExplainer />} />

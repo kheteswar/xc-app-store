@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ArrowLeft, ArrowRight, ArrowRightLeft, Check, Search, Server, Shield,
   Globe, Loader2, Split, Database, LayoutList, X, Play,
   Key, Eye, CheckCircle, Cloud,
-  FileJson, Activity, Code, Filter, ChevronRight, Zap, HelpCircle
+  FileJson, Activity, Code, Filter, ChevronRight, Zap, HelpCircle, RefreshCw
 } from 'lucide-react';
 import { apiClient } from '../services/api';
 import { useApp } from '../context/AppContext';
@@ -40,6 +40,9 @@ interface DeepCompositeObject {
   [section: string]: any;
 }
 
+// How to re-fetch a single section's live config (used by per-object Refresh).
+interface SectionMeta { apiPath: string; name: string; namespace: string; }
+
 interface CompareMeta {
   title: string;
   subA: string;
@@ -62,8 +65,87 @@ const formatValue = (val: any): string => {
   return String(val);
 };
 
-const flattenObject = (obj: any, prefix = ''): Record<string, any> => {
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: IDENTITY-BASED ARRAY KEYS
+// Arrays of objects (especially LB routes) must align by CONTENT, not position.
+// Otherwise an inserted/removed route shifts every later index and cascades one
+// real change into many false "differences".
+// ═══════════════════════════════════════════════════════════════════════════
+
+const stableStringify = (v: any): string => {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+};
+
+const shortHash = (s: string): string => {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36).slice(0, 5);
+};
+
+const sanitizeSeg = (s: any): string => String(s).replace(/\./g, '·');
+
+// Natural, numeric-aware compare so "A#2" sorts before "A#10" (not after "A#1").
+const naturalCompare = (a: string, b: string): number =>
+  a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
+// A distinguishing scalar for a nameless object (so a list item labels as its
+// ip_address / address / prefix instead of a generic "item").
+const SCALAR_ID_KEYS = ['ip_address', 'address', 'ip', 'dns_name', 'hostname', 'host', 'endpoint', 'url', 'prefix', 'fqdn'];
+const scalarId = (item: any): string | null => {
+  for (const k of SCALAR_ID_KEYS) if (item && typeof item[k] === 'string' && item[k]) return item[k];
+  return null;
+};
+
+const ROUTE_KINDS = ['simple_route', 'redirect_route', 'direct_response_route', 'custom_route_object'];
+// A route's identity is its MATCH condition set — never its action fields
+// (pools, host_rewrite, redirect target, response), which are exactly what we
+// want a matched route to surface as a diff.
+const ROUTE_MATCH_KEYS = ['path', 'headers', 'http_method', 'query_params', 'query_parameters', 'incoming_port'];
+
+const routeKey = (item: any): string | null => {
+  const kind = ROUTE_KINDS.find(k => item && item[k]);
+  if (!kind) return null;
+  const sub = item[kind] || {};
+  const match: any = {};
+  for (const k of ROUTE_MATCH_KEYS) if (sub[k] !== undefined) match[k] = sub[k];
+  // header order is not semantically meaningful — sort so it doesn't affect identity
+  if (Array.isArray(match.headers)) match.headers = [...match.headers].sort((a, b) => stableStringify(a).localeCompare(stableStringify(b)));
+  const sig = stableStringify({ kind, match });
+  const kindShort = kind.replace('_route', '').replace('custom_route_object', 'custom');
+  const p = sub.path || {};
+  let path = p.prefix ?? p.path ?? (p.regex !== undefined ? 're:' + p.regex : '/*');
+  path = sanitizeSeg(path);
+  if (path.length > 24) path = path.slice(0, 24) + '…';
+  return `${kindShort} ${path} ~${shortHash(sig)}`;
+};
+
+// Stable key for one item of an array-of-objects: route identity → name → index.
+const arrayItemKey = (item: any, index: number): string => {
+  const rk = routeKey(item);
+  if (rk) return rk;
+  if (item && typeof item === 'object') {
+    if (typeof item.name === 'string' && item.name) return sanitizeSeg(item.name);
+    if (item.pool && typeof item.pool.name === 'string' && item.pool.name) return sanitizeSeg(item.pool.name);
+    const s = scalarId(item); if (s) return sanitizeSeg(s);
+  }
+  return String(index);
+};
+
+// System-populated runtime / status fields that are NOT user configuration — they
+// naturally differ between any two objects (resolved VIP, auto hostname, cert
+// state, object uid/timestamps…) and would otherwise show as false "drift".
+const RUNTIME_KEYS = new Set([
+  'dns_info', 'host_name', 'state', 'auto_cert_info', 'auto_cert_state', 'dns_records',
+  'cname', 'internet_vip_info', 'vip_info', 'cert_state', 'downstream_tls_certificate_expiration_timestamps',
+  'uid', 'creation_timestamp', 'modification_timestamp', 'resource_version',
+  'creator_class', 'creator_id', 'object_index', 'system_metadata', 'metadata_version',
+]);
+
+const flattenObject = (obj: any, prefix = '', ignore?: Set<string>): Record<string, any> => {
   return Object.keys(obj || {}).reduce((acc: any, k) => {
+    if (ignore && ignore.has(k)) return acc;   // skip runtime/system fields
     const pre = prefix.length ? prefix + '.' : '';
     const val = obj[k];
     const newKey = pre + k;
@@ -74,21 +156,181 @@ const flattenObject = (obj: any, prefix = ''): Record<string, any> => {
       } else if (typeof val[0] !== 'object' && val[0] !== null) {
         acc[newKey] = val.join(', ');
       } else {
+        const seen = new Map<string, number>();
         val.forEach((item, i) => {
-          Object.assign(acc, flattenObject(item, `${newKey}[${i}]`));
+          let idKey = arrayItemKey(item, i);
+          if (seen.has(idKey)) { const n = (seen.get(idKey) as number) + 1; seen.set(idKey, n); idKey = `${idKey}#${n}`; }
+          else seen.set(idKey, 0);
+          Object.assign(acc, flattenObject(item, `${newKey}[${idKey}]`, ignore));
         });
       }
     } else if (val !== null && typeof val === 'object') {
       if (Object.keys(val).length === 0) {
         acc[newKey] = 'Enabled';
       } else {
-        Object.assign(acc, flattenObject(val, newKey));
+        Object.assign(acc, flattenObject(val, newKey, ignore));
       }
     } else {
       acc[newKey] = val;
     }
     return acc;
   }, {});
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: INTELLIGENT ARRAY / ROUTE MATCHING
+// Instead of comparing arrays position-by-position, we compare EVERY item on one
+// side against every item on the other, score similarity, and compute the best
+// 1:1 pairing. Matched items line up (even if lightly edited); unmatched items
+// are isolated as added / removed — so a route inserted mid-list never shifts
+// or breaks the comparison of the others.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const nameOf = (item: any): string | null => {
+  if (!item || typeof item !== 'object') return null;
+  if (typeof item.name === 'string' && item.name) return item.name;
+  if (item.pool && typeof item.pool.name === 'string' && item.pool.name) return item.pool.name;
+  return scalarId(item);
+};
+
+const routeKindOf = (item: any): string | null => ROUTE_KINDS.find(k => item && item[k]) || null;
+const routePath = (sub: any): string => {
+  const p = sub?.path || {};
+  return p.prefix ?? p.path ?? (p.regex !== undefined ? 're:' + p.regex : '/*');
+};
+
+// Route similarity: driven by MATCH conditions (kind, path, headers, method),
+// with a small action tiebreak. 1.0 = same route; 0 = unrelated.
+const routeSimilarity = (a: any, b: any): number => {
+  const ka = routeKindOf(a), kb = routeKindOf(b);
+  const sa = a[ka as string] || {}, sb = b[kb as string] || {};
+  let score = 0;
+  if (ka && ka === kb) score += 0.20;
+  if (stableStringify(sa.path || {}) === stableStringify(sb.path || {})) score += 0.45;
+  else {
+    const A = routePath(sa), B = routePath(sb);
+    if (A && B && (A.startsWith(B) || B.startsWith(A))) score += 0.28; // edited path still pairs
+  }
+  const hset = (s: any) => new Set((s.headers || []).map((h: any) => stableStringify(h)));
+  const ha = hset(sa), hb = hset(sb);
+  if (ha.size || hb.size) {
+    let inter = 0; ha.forEach(x => { if (hb.has(x)) inter++; });
+    score += 0.18 * (inter / (new Set([...ha, ...hb]).size || 1));
+  } else score += 0.18;
+  if ((sa.http_method || 'ANY') === (sb.http_method || 'ANY')) score += 0.09;
+  const act = (s: any) => stableStringify({ pools: (s.origin_pools || []).map((p: any) => p?.pool?.name).sort(), host_rewrite: s.host_rewrite });
+  if (act(sa) === act(sb)) score += 0.08;
+  return Math.min(1, score);
+};
+
+const genericSimilarity = (a: any, b: any): number => {
+  if (stableStringify(a) === stableStringify(b)) return 1;
+  const toks = (o: any) => new Set(Object.entries(flattenObject(o)).map(([k, v]) => `${k}=${formatValue(v)}`));
+  const ta = toks(a), tb = toks(b);
+  if (!ta.size && !tb.size) return 1;
+  let inter = 0; ta.forEach(x => { if (tb.has(x)) inter++; });
+  return inter / (new Set([...ta, ...tb]).size || 1);
+};
+
+const similarity = (a: any, b: any): number =>
+  (routeKindOf(a) && routeKindOf(b)) ? routeSimilarity(a, b) : genericSimilarity(a, b);
+
+// Origin-server-like objects carry their identity in a typed sub-object.
+const ORIGIN_ID_PATHS: [string, string][] = [
+  ['public_ip', 'ip'], ['private_ip', 'ip'], ['public_name', 'dns_name'], ['private_name', 'dns_name'],
+  ['k8s_service', 'service_name'], ['consul_service', 'service_name'], ['vn_private_ip', 'ip'], ['vn_private_name', 'dns_name'],
+];
+const prettyLabel = (item: any): string => {
+  const rk = routeKindOf(item);
+  if (rk) return sanitizeSeg(`${rk.replace('_route', '').replace('custom_route_object', 'custom')} ${routePath(item[rk] || {})}`).slice(0, 40);
+  const n = nameOf(item);
+  if (n) return sanitizeSeg(n);
+  for (const [t, f] of ORIGIN_ID_PATHS) if (item && item[t] && typeof item[t][f] === 'string' && item[t][f]) return sanitizeSeg(`${t} ${item[t][f]}`).slice(0, 40);
+  return 'item';
+};
+
+const isObjArray = (v: any): boolean => Array.isArray(v) && v.length > 0 && v.some(x => x && typeof x === 'object' && !Array.isArray(x));
+
+// Align two arrays of objects → parallel maps keyed by a shared label per matched
+// pair; unmatched items get one-sided keys (added / removed).
+const alignArrays = (a: any[], b: any[]): { map1: Record<string, any>; map2: Record<string, any> } => {
+  const THRESHOLD = 0.35;
+  const usedA = new Set<number>(), usedB = new Set<number>();
+  const pairByI = new Map<number, number>();
+
+  const namesA = a.map(nameOf), namesB = b.map(nameOf);
+  const uniqueNamed = (arr: (string | null)[]) => arr.length > 0 && arr.every(Boolean) && new Set(arr).size === arr.length;
+
+  if (uniqueNamed(namesA) && uniqueNamed(namesB)) {
+    // fast, exact path: unique names on both sides → match by name
+    const idxB = new Map(namesB.map((n, j) => [n, j] as [string | null, number]));
+    a.forEach((_, i) => { const j = idxB.get(namesA[i]); if (j !== undefined && !usedB.has(j)) { pairByI.set(i, j); usedA.add(i); usedB.add(j); } });
+  } else {
+    // similarity assignment: score all pairs, greedily take best-first
+    const cand: Array<{ i: number; j: number; s: number }> = [];
+    a.forEach((ai, i) => b.forEach((bj, j) => { const s = similarity(ai, bj); if (s >= THRESHOLD) cand.push({ i, j, s }); }));
+    cand.sort((x, y) => y.s - x.s || x.i - y.i || x.j - y.j);
+    for (const c of cand) if (!usedA.has(c.i) && !usedB.has(c.j)) { pairByI.set(c.i, c.j); usedA.add(c.i); usedB.add(c.j); }
+  }
+
+  // Positional fallback for weakly-identified items (no name / route identity),
+  // e.g. origin_servers: pair any still-unmatched items in order so equal-length
+  // lists map 1-1 (showing the field-level diff) instead of add + remove.
+  const isRoutes = a.some(x => routeKindOf(x)) || b.some(x => routeKindOf(x));
+  if (!isRoutes && namesA.every(n => n === null) && namesB.every(n => n === null)) {
+    const remA = a.map((_, i) => i).filter(i => !usedA.has(i));
+    const remB = b.map((_, j) => j).filter(j => !usedB.has(j));
+    const n = Math.min(remA.length, remB.length);
+    for (let k = 0; k < n; k++) { pairByI.set(remA[k], remB[k]); usedA.add(remA[k]); usedB.add(remB[k]); }
+  }
+
+  const map1: Record<string, any> = {}, map2: Record<string, any> = {};
+  const used = new Set<string>();
+  const uniq = (base: string) => { let k = base, n = 2; while (used.has(k)) k = `${base} #${n++}`; used.add(k); return k; };
+
+  // For routes, prefix the label with the 1-based position on each side (which
+  // can differ after identity matching), e.g. "A#3 B#2 simple /digital/web/".
+  const numbered = isRoutes;
+  const mkLabel = (item: any, aIdx: number | null, bIdx: number | null) => {
+    const base = prettyLabel(item);
+    if (!numbered) return base;
+    const p: string[] = [];
+    if (aIdx !== null) p.push(`A#${aIdx + 1}`);
+    if (bIdx !== null) p.push(`B#${bIdx + 1}`);
+    return `${p.join(' ')} ${base}`;
+  };
+
+  a.forEach((ai, i) => {
+    const j = pairByI.get(i);
+    const key = uniq(mkLabel(ai, i, j !== undefined ? j : null));
+    if (j !== undefined) { const [x, y] = alignPair(ai, b[j]); map1[key] = x; map2[key] = y; }
+    else map1[key] = ai; // removed (source-only)
+  });
+  b.forEach((bj, j) => { if (!usedB.has(j)) map2[uniq(mkLabel(bj, null, j))] = bj; }); // added (dest-only)
+
+  return { map1, map2 };
+};
+
+// Deep parallel walk that aligns every matched array-of-objects (routes, pools,
+// policies, headers…) before flattening, so both sides share keys.
+const alignPair = (src: any, dest: any): [any, any] => {
+  if (src && dest && typeof src === 'object' && typeof dest === 'object' && !Array.isArray(src) && !Array.isArray(dest)) {
+    const out1: any = {}, out2: any = {};
+    for (const k of new Set([...Object.keys(src), ...Object.keys(dest)])) {
+      const a = src[k], b = dest[k];
+      if (isObjArray(a) && isObjArray(b)) {
+        const { map1, map2 } = alignArrays(a, b);
+        out1[k] = map1; out2[k] = map2;
+      } else if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
+        const [x, y] = alignPair(a, b); out1[k] = x; out2[k] = y;
+      } else {
+        if (k in src) out1[k] = a;
+        if (k in dest) out2[k] = b;
+      }
+    }
+    return [out1, out2];
+  }
+  return [src, dest];
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -134,8 +376,14 @@ export function ConfigComparator() {
   const [compareMeta, setCompareMeta] = useState<CompareMeta | null>(null);
   const [deepSource, setDeepSource] = useState<DeepCompositeObject | null>(null);
   const [deepDest, setDeepDest] = useState<DeepCompositeObject | null>(null);
+  const [deepSourceMeta, setDeepSourceMeta] = useState<Record<string, SectionMeta> | null>(null);
+  const [deepDestMeta, setDeepDestMeta] = useState<Record<string, SectionMeta> | null>(null);
+  const [refreshingSection, setRefreshingSection] = useState<string | null>(null);
+  const srcFetcherRef = useRef<((p: string) => Promise<any>) | null>(null);
+  const destFetcherRef = useRef<((p: string) => Promise<any>) | null>(null);
   const [isDeepLoading, setIsDeepLoading] = useState(false);
   const [showDiffOnly, setShowDiffOnly] = useState(false);
+  const [hideRuntime, setHideRuntime] = useState(true);
   const [jsonModal, setJsonModal] = useState<{ title: string; src: any; dest: any } | null>(null);
 
   // Determine if Source and Dest are exactly the same Scope
@@ -301,15 +549,17 @@ export function ConfigComparator() {
 
   // ─── DEEP FETCH ENGINE ───────────────────────────────────────────────
   
-  const fetchDeepConfig = async (objName: string, objType: ObjectType, namespace: string, fetcher: (p: string) => Promise<any>): Promise<DeepCompositeObject> => {
+  const fetchDeepConfig = async (objName: string, objType: ObjectType, namespace: string, fetcher: (p: string) => Promise<any>): Promise<{ composite: DeepCompositeObject; meta: Record<string, SectionMeta> }> => {
     const composite: DeepCompositeObject = {};
+    const meta: Record<string, SectionMeta> = {};
     const apiType = objType === 'http_loadbalancer' ? 'http_loadbalancers' : 'cdn_loadbalancers';
-    
+
     let mainObj;
     try {
       mainObj = await fetcher(`/api/config/namespaces/${namespace}/${apiType}/${objName}`);
       composite['01_Main_Configuration'] = mainObj.spec;
-    } catch { return { Error: `Failed to fetch main object: ${objName}` }; }
+      meta['01_Main_Configuration'] = { apiPath: apiType, name: objName, namespace };
+    } catch { return { composite: { Error: `Failed to fetch main object: ${objName}` }, meta }; }
 
     const spec = mainObj.spec;
 
@@ -317,6 +567,7 @@ export function ConfigComparator() {
       if (!ref || !ref.name) return;
       const refNs = ref.namespace || namespace;
       const key = `${keyPrefix} (${ref.name})`;
+      meta[key] = { apiPath, name: ref.name, namespace: refNs };
       try {
         const res = await fetcher(`/api/config/namespaces/${refNs}/${apiPath}/${ref.name}`);
         composite[key] = res.spec;
@@ -358,6 +609,7 @@ export function ConfigComparator() {
       if (!poolRef) continue;
       const pNs = poolRef.namespace || namespace;
       const poolKey = `06_Origin_Pool (${poolRef.name})`;
+      meta[poolKey] = { apiPath: 'origin_pools', name: poolRef.name, namespace: pNs };
       try {
         const poolObj = await fetcher(`/api/config/namespaces/${pNs}/origin_pools/${poolRef.name}`);
         composite[poolKey] = poolObj.spec;
@@ -370,7 +622,7 @@ export function ConfigComparator() {
       } catch { composite[poolKey] = { error: 'Failed to fetch pool' }; }
     }
 
-    return composite;
+    return { composite, meta };
   };
 
   const startStandardCompare = async (item: OverviewItem) => {
@@ -381,22 +633,26 @@ export function ConfigComparator() {
     
     setCompareMeta({
       title: item.name,
-      subA: `${config.sourceNs} (Source)`,
-      subB: `${config.destNs} (Dest)`,
+      subA: config.mode === 'tenant' ? `${currentTenant}` : `${config.sourceNs}`,
+      subB: config.mode === 'tenant' ? `${config.destTenant}` : `${config.destNs}`,
       iconA: item.type,
       iconB: item.type,
       nameA: item.name,
       nameB: item.name
     });
     setStep(3);
+    srcFetcherRef.current = fetchFromSource;
+    destFetcherRef.current = fetchFromDest;
 
     try {
       const [src, dest] = await Promise.all([
         item.sourceObj ? fetchDeepConfig(item.name, item.type, config.sourceNs, fetchFromSource) : Promise.resolve(null),
         item.destObj ? fetchDeepConfig(item.name, item.type, config.destNs, fetchFromDest) : Promise.resolve(null)
       ]);
-      setDeepSource(src);
-      setDeepDest(dest);
+      setDeepSource(src?.composite ?? null);
+      setDeepSourceMeta(src?.meta ?? null);
+      setDeepDest(dest?.composite ?? null);
+      setDeepDestMeta(dest?.meta ?? null);
     } catch (e: any) {
       toast.error('Deep compare error: ' + e.message);
       setStep(2);
@@ -421,28 +677,70 @@ export function ConfigComparator() {
       ? { ns: config.destNs, side: 'Dest', fetcher: fetchFromDest } 
       : { ns: config.sourceNs, side: 'Source', fetcher: fetchFromSource };
 
+    // Label each side by its identifying scope: the tenant name for a cross-tenant
+    // comparison, the namespace name for a cross-namespace comparison.
+    const tenantOfSide = (side: string) =>
+      config.mode === 'tenant' && side === 'Dest' ? config.destTenant : currentTenant;
+    const subLabel = (ns: string, side: string) =>
+      config.mode === 'tenant' ? `${tenantOfSide(side)}` : `${ns}`;
+
     setCompareMeta({
       title: `${itemA.name} vs ${itemB.name}`,
-      subA: `${targetA.ns} (${targetA.side})`,
-      subB: `${targetB.ns} (${targetB.side})`,
+      subA: subLabel(targetA.ns, targetA.side),
+      subB: subLabel(targetB.ns, targetB.side),
       iconA: itemA.type,
       iconB: itemB.type,
       nameA: itemA.name,
       nameB: itemB.name
     });
     setStep(3);
+    srcFetcherRef.current = targetA.fetcher;
+    destFetcherRef.current = targetB.fetcher;
 
     try {
       const [src, dest] = await Promise.all([
         fetchDeepConfig(itemA.name, itemA.type, targetA.ns, targetA.fetcher),
         fetchDeepConfig(itemB.name, itemB.type, targetB.ns, targetB.fetcher)
       ]);
-      setDeepSource(src);
-      setDeepDest(dest);
+      setDeepSource(src?.composite ?? null);
+      setDeepSourceMeta(src?.meta ?? null);
+      setDeepDest(dest?.composite ?? null);
+      setDeepDestMeta(dest?.meta ?? null);
     } catch (e: any) {
       toast.error('Deep compare error: ' + e.message);
       setStep(2);
     } finally { setIsDeepLoading(false); }
+  };
+
+  // Re-fetch a single object's live config (both sides) and re-diff, without
+  // restarting the flow. Used by the per-section Refresh buttons.
+  const refreshSection = async (sectionKey: string) => {
+    setRefreshingSection(sectionKey);
+    try {
+      const sm = deepSourceMeta?.[sectionKey];
+      const dm = deepDestMeta?.[sectionKey];
+      const tasks: Promise<void>[] = [];
+      if (sm && srcFetcherRef.current) {
+        tasks.push(srcFetcherRef.current(`/api/config/namespaces/${sm.namespace}/${sm.apiPath}/${sm.name}`)
+          .then(r => setDeepSource(prev => ({ ...(prev || {}), [sectionKey]: r.spec })))
+          .catch(() => setDeepSource(prev => ({ ...(prev || {}), [sectionKey]: { error: 'Refetch failed' } }))));
+      }
+      if (dm && destFetcherRef.current) {
+        tasks.push(destFetcherRef.current(`/api/config/namespaces/${dm.namespace}/${dm.apiPath}/${dm.name}`)
+          .then(r => setDeepDest(prev => ({ ...(prev || {}), [sectionKey]: r.spec })))
+          .catch(() => setDeepDest(prev => ({ ...(prev || {}), [sectionKey]: { error: 'Refetch failed' } }))));
+      }
+      if (!tasks.length) { toast.warning('Nothing to refresh for this section'); return; }
+      await Promise.all(tasks);
+      toast.success(`Refreshed ${sectionKey.replace(/^\d+_/, '').replace(/_/g, ' ')}`);
+    } catch (e: any) {
+      toast.error('Refresh failed: ' + e.message);
+    } finally { setRefreshingSection(null); }
+  };
+
+  const refreshAll = () => {
+    if (currentCompareItem) startStandardCompare(currentCompareItem);
+    else if (selectedRows.length === 2) startCustomCompare();
   };
 
   const toggleRowSelection = (item: OverviewItem) => {
@@ -510,16 +808,25 @@ export function ConfigComparator() {
 
   const renderDiffTable = () => {
     if (!deepSource && !deepDest) return null;
-    const allSections = Array.from(new Set([...Object.keys(deepSource || {}), ...Object.keys(deepDest || {})])).sort();
+    const allSections = Array.from(new Set([...Object.keys(deepSource || {}), ...Object.keys(deepDest || {})])).sort(naturalCompare);
+
+    // When comparing across tenants, the `tenant` field of every object reference
+    // naturally differs (it just names the tenant each config lives in) and is not
+    // a real configuration difference — suppress it from the diff. The tenant name
+    // is surfaced in the column headings instead. Keys named `tenant` are skipped
+    // at any nesting level during flatten.
+    const ignore = (hideRuntime || config.mode === 'tenant')
+      ? new Set<string>([...(hideRuntime ? RUNTIME_KEYS : []), ...(config.mode === 'tenant' ? ['tenant'] : [])])
+      : undefined;
 
     return allSections.map(section => {
       const displayTitle = section.replace(/^\d+_/, '').replace(/_/g, ' ');
       const srcRaw = deepSource?.[section];
       const destRaw = deepDest?.[section];
-      
-      const srcFlat = srcRaw ? flattenObject(srcRaw) : {};
-      const destFlat = destRaw ? flattenObject(destRaw) : {};
-      const allProps = Array.from(new Set([...Object.keys(srcFlat), ...Object.keys(destFlat)])).sort();
+      const [srcAligned, destAligned] = (srcRaw && destRaw) ? alignPair(srcRaw, destRaw) : [srcRaw, destRaw];
+      const srcFlat = srcRaw ? flattenObject(srcAligned, '', ignore) : {};
+      const destFlat = destRaw ? flattenObject(destAligned, '', ignore) : {};
+      const allProps = Array.from(new Set([...Object.keys(srcFlat), ...Object.keys(destFlat)])).sort(naturalCompare);
 
       const hasDifferences = allProps.some(p => formatValue(srcFlat[p]) !== formatValue(destFlat[p]));
       if (showDiffOnly && !hasDifferences) return null;
@@ -540,12 +847,22 @@ export function ConfigComparator() {
               <h3 className="font-bold text-slate-100 text-sm uppercase tracking-wider">{displayTitle}</h3>
               {hasDifferences && <span className="text-[10px] bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/20 font-bold ml-2 shadow-[0_0_8px_rgba(99,102,241,0.2)]">Differences Found</span>}
             </div>
-            <button 
-              onClick={() => setJsonModal({ title: displayTitle, src: srcRaw, dest: destRaw })}
-              className="text-xs flex items-center gap-1.5 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 rounded-md transition-colors shadow-sm"
-            >
-              <Code className="w-3 h-3"/> View JSON
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => refreshSection(section)}
+                disabled={refreshingSection === section}
+                title="Re-fetch this object's live config and re-compare"
+                className="text-xs flex items-center gap-1.5 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 rounded-md transition-colors shadow-sm disabled:opacity-50"
+              >
+                {refreshingSection === section ? <Loader2 className="w-3 h-3 animate-spin"/> : <RefreshCw className="w-3 h-3"/>} Refresh
+              </button>
+              <button
+                onClick={() => setJsonModal({ title: displayTitle, src: srcRaw, dest: destRaw })}
+                className="text-xs flex items-center gap-1.5 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 rounded-md transition-colors shadow-sm"
+              >
+                <Code className="w-3 h-3"/> View JSON
+              </button>
+            </div>
           </div>
           
           <div className="overflow-auto max-h-[60vh] custom-scrollbar">
@@ -915,13 +1232,21 @@ export function ConfigComparator() {
                    >
                      All Properties
                    </button>
-                   <button 
-                     onClick={() => setShowDiffOnly(true)} 
+                   <button
+                     onClick={() => setShowDiffOnly(true)}
                      className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all flex items-center gap-1.5 ${showDiffOnly ? 'bg-amber-500/20 text-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.2)]' : 'text-slate-500 hover:text-slate-300'}`}
                    >
                      <Filter className="w-3 h-3"/> Diffs Only
                    </button>
                  </div>
+
+                 <button
+                   onClick={() => setHideRuntime(h => !h)}
+                   title="System/runtime fields (dns_info, host_name, state, cert, uid, timestamps…) always differ between objects and are not configuration. Toggle to show them."
+                   className={`px-3 py-1.5 text-xs font-bold rounded-md border transition-all flex items-center gap-1.5 ${hideRuntime ? 'bg-slate-900/80 text-slate-400 border-slate-700 hover:text-slate-200' : 'bg-amber-500/15 text-amber-300 border-amber-500/30'}`}
+                 >
+                   <Eye className="w-3 h-3"/> {hideRuntime ? 'Runtime hidden' : 'Runtime shown'}
+                 </button>
                </div>
                
                <div className="flex items-center gap-3">
@@ -935,6 +1260,9 @@ export function ConfigComparator() {
                       Compare Next <ArrowRight className="w-4 h-4"/>
                     </button>
                  )}
+                 <button onClick={refreshAll} disabled={isDeepLoading} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm text-white transition-colors flex items-center gap-2 disabled:opacity-50" title="Re-fetch every object and re-compare">
+                   <RefreshCw className={`w-4 h-4 ${isDeepLoading ? 'animate-spin' : ''}`}/> Refresh All
+                 </button>
                  <button onClick={() => setStep(2)} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm text-white transition-colors">
                    Back to List
                  </button>

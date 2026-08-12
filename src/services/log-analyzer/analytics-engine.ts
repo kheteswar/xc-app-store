@@ -4,7 +4,7 @@ import type {
   ErrorAnalysis, PerformanceAnalysis, SecurityInsights, TopTalker, StatusTimeSeriesPoint,
   BreakdownResult, BreakdownEntry, BreakdownSubValue, AggregatedLogData,
 } from './types';
-import type { AggBucket } from './aggregation-client';
+import type { AggBucket, NestedBreakdownEntry } from './aggregation-client';
 import { FIELD_DEFINITIONS } from './field-definitions';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -817,6 +817,168 @@ export function buildStringStatsFromBuckets(
     totalCount: totalHits,
     uniqueCount: buckets.length,
     topValues,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NUMERIC STATS FROM AGGREGATION (full-dataset via avg/min/max + topk buckets)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Build NumericFieldStats from server-side aggregation results.
+ *
+ * Combines:
+ *   - `numeric` (avg/min/max from XC min/max/avg aggregations, when field is
+ *     one of the enumerated numeric fields — DURATION_WITH_DATA_TX_DELAY,
+ *     TIMESTAMP)
+ *   - `buckets` from a large-topk field aggregation (numeric field treated as
+ *     keyword) — used to compute exact percentiles + median + stdDev + histogram
+ *     across the full dataset.
+ *
+ * If `numeric` avg/min/max are all null, min/max/mean are derived from buckets
+ * (still accurate provided topk is large enough to cover the distribution).
+ */
+export function buildNumericStatsFromAgg(
+  buckets: AggBucket[],
+  fieldKey: string,
+  numeric: { avg: number | null; min: number | null; max: number | null },
+  totalHits: number,
+): NumericFieldStats {
+  const def = FIELD_DEFINITIONS.find(f => f.key === fieldKey);
+  const label = def?.label ?? fieldKey;
+
+  // Convert buckets → sorted value/count array
+  const valueCounts: Array<{ value: number; count: number }> = [];
+  for (const b of buckets) {
+    const v = Number(b.key);
+    if (isFinite(v)) valueCounts.push({ value: v, count: b.count });
+  }
+  valueCounts.sort((a, b) => a.value - b.value);
+
+  const bucketTotalCount = valueCounts.reduce((s, x) => s + x.count, 0);
+  if (bucketTotalCount === 0 && numeric.avg === null) {
+    return {
+      field: fieldKey, label, count: 0, sum: 0, min: 0, max: 0,
+      mean: 0, median: 0, stdDev: 0, p50: 0, p75: 0, p90: 0, p95: 0, p99: 0,
+      histogram: [],
+    };
+  }
+
+  // Choose "coverage" — how much of totalHits the buckets cover
+  const coverage = totalHits > 0 ? bucketTotalCount / totalHits : 1;
+
+  // Percentile from bucket distribution
+  const percentileFromBuckets = (p: number): number => {
+    if (valueCounts.length === 0) return 0;
+    const target = (p / 100) * bucketTotalCount;
+    let running = 0;
+    for (const vc of valueCounts) {
+      running += vc.count;
+      if (running >= target) return vc.value;
+    }
+    return valueCounts[valueCounts.length - 1].value;
+  };
+
+  const min = numeric.min ?? (valueCounts[0]?.value ?? 0);
+  const max = numeric.max ?? (valueCounts[valueCounts.length - 1]?.value ?? 0);
+  const bucketSum = valueCounts.reduce((s, x) => s + x.value * x.count, 0);
+  const mean = numeric.avg ?? (bucketTotalCount > 0 ? bucketSum / bucketTotalCount : 0);
+  const sum = numeric.avg !== null ? numeric.avg * totalHits : bucketSum;
+
+  // stdDev from bucket distribution (variance-weighted)
+  let variance = 0;
+  if (bucketTotalCount > 0) {
+    for (const vc of valueCounts) {
+      variance += vc.count * (vc.value - mean) ** 2;
+    }
+    variance /= bucketTotalCount;
+  }
+  const stdDev = Math.sqrt(variance);
+
+  const p50 = percentileFromBuckets(50);
+  const p75 = percentileFromBuckets(75);
+  const p90 = percentileFromBuckets(90);
+  const p95 = percentileFromBuckets(95);
+  const p99 = percentileFromBuckets(99);
+
+  // Histogram: bin the top-K values into <=20 buckets between min and max
+  const histogram: Array<{ bucket: string; count: number }> = [];
+  if (valueCounts.length > 0) {
+    const range = max - min;
+    if (range === 0) {
+      histogram.push({ bucket: formatValue(min), count: bucketTotalCount });
+    } else {
+      const binCount = Math.min(20, Math.max(5, Math.ceil(Math.sqrt(valueCounts.length))));
+      const binSize = range / binCount;
+      const bins = new Array(binCount).fill(0);
+      for (const vc of valueCounts) {
+        const idx = Math.min(Math.floor((vc.value - min) / binSize), binCount - 1);
+        bins[idx] += vc.count;
+      }
+      for (let i = 0; i < binCount; i++) {
+        const lo = min + i * binSize;
+        const hi = lo + binSize;
+        histogram.push({ bucket: `${formatValue(lo)}-${formatValue(hi)}`, count: bins[i] });
+      }
+    }
+  }
+
+  return {
+    field: fieldKey,
+    label: coverage < 0.95 && numeric.avg === null
+      ? `${label} (top-${valueCounts.length} values, ${(coverage * 100).toFixed(0)}% of dataset)`
+      : label,
+    count: numeric.avg !== null ? totalHits : bucketTotalCount,
+    sum,
+    min,
+    max,
+    mean,
+    median: p50,
+    stdDev,
+    p50, p75, p90, p95, p99,
+    histogram,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAKDOWN FROM NESTED (N+1) AGGREGATIONS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Build a BreakdownResult from the response of `fetchNestedBreakdown()`.
+ * Each entry already carries primaryValue + primaryCount + per-breakdown-field buckets.
+ */
+export function buildBreakdownFromNestedAggs(
+  entries: NestedBreakdownEntry[],
+  primaryField: string,
+  breakdownFieldKeys: string[],
+): BreakdownResult {
+  const primaryDef = FIELD_DEFINITIONS.find(f => f.key === primaryField);
+  const breakdownDefs = breakdownFieldKeys.map(k => {
+    const def = FIELD_DEFINITIONS.find(f => f.key === k);
+    return { key: k, label: def?.label ?? k };
+  });
+
+  const outEntries: BreakdownEntry[] = entries
+    .filter(e => e && e.primaryValue !== undefined)
+    .map(e => {
+      const breakdowns: Record<string, BreakdownSubValue[]> = {};
+      for (const bField of breakdownFieldKeys) {
+        const buckets = e.breakdowns[bField] || [];
+        breakdowns[bField] = buckets.map(b => ({ value: b.key, count: b.count }));
+      }
+      return {
+        primaryValue: e.primaryValue,
+        primaryCount: e.primaryCount,
+        breakdowns,
+      };
+    });
+
+  return {
+    primaryField,
+    primaryLabel: primaryDef?.label ?? primaryField,
+    breakdownFields: breakdownDefs,
+    entries: outEntries,
   };
 }
 

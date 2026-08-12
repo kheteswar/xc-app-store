@@ -69,9 +69,6 @@ export interface ProgressiveJobConfig {
   namespace: string;
   lbName: string;
   domains: string[];
-  /** Full spec.domains of the LB (optional). When `domains` covers this whole list,
-   *  the domain filter is skipped — the vh_name scope already covers everything. */
-  allDomains?: string[];
   scopes: AnalysisScope[];   // only 'waf_signatures' | 'waf_violations' are honored
   hoursBack: number;
 }
@@ -131,23 +128,6 @@ function getNum(e: RawEvent, key: string): number {
   if (typeof v === 'number') return v;
   if (typeof v === 'string') return parseInt(v, 10) || 0;
   return 0;
-}
-
-// ── Domain matching helpers ───────────────────────────────────────
-/** Escape regex metacharacters so a domain is a literal inside an RE2 pattern. */
-function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-/** LB domain → RE2 fragment. `*.example.com` → any subdomain; otherwise exact literal. */
-function domainToRegex(d: string): string {
-  return d.startsWith('*.') ? `.*\\.${escapeRe(d.slice(2))}` : escapeRe(d);
-}
-
-/** Host ↔ LB-domain match with wildcard support (`*.example.com` ⊇ a.example.com, a.b.example.com — not the apex). */
-function hostMatchesDomain(host: string, domain: string): boolean {
-  const h = host.toLowerCase();
-  const d = domain.toLowerCase();
-  if (d.startsWith('*.')) { const suffix = d.slice(1); return h.endsWith(suffix) && h.length > suffix.length; }
-  return h === d;
 }
 function parseTotalHits(raw: unknown): number {
   if (typeof raw === 'number' && isFinite(raw)) return Math.floor(raw);
@@ -351,39 +331,10 @@ export class ProgressiveAnalysisJob {
 
   private get vhName(): string { return `ves-io-http-loadbalancer-${this.config.lbName}`; }
 
-  // ── Domain scoping ────────────────────────────────────────────
-  // XC log queries index the request Host as `domain` / `authority` — there is no
-  // `req_host` key, so the previous `req_host=...` filter matched zero rows on every
-  // tenant (see PRE_FETCH_FILTER_FIELDS in src/services/log-analyzer/field-definitions.ts
-  // for the supported keys). The server-side filter here is a bandwidth optimization;
-  // correctness is ALSO guaranteed by the always-on client-side scoping in
-  // eventInSelectedDomains() — same philosophy as the malicious-bot exclude.
-
-  /** True only when the user narrowed the selection → a filter is actually needed. */
-  private get domainFilterActive(): boolean {
-    const sel = this.config.domains || [];
-    if (sel.length === 0) return false;
-    const all = this.config.allDomains || [];
-    if (all.length > 0 && sel.length >= all.length) return false; // all domains selected → vh_name scope already covers it
-    return true;
-  }
-
   private get domainFilter(): string {
-    if (!this.domainFilterActive) return '';
-    const sel = this.config.domains;
-    const hasWildcard = sel.some(d => d.startsWith('*.'));
-    if (sel.length === 1 && !hasWildcard) return `, domain="${sel[0]}"`;
-    // Multi-domain / wildcard → RE2 alternation of escaped literals.
-    return `, domain=~"${sel.map(domainToRegex).join('|')}"`;
-  }
-
-  /** Client-side check: does this event/log belong to a selected domain?
-   *  Checks `domain` first, then `authority` (Host header, minus any :port). */
-  private eventInSelectedDomains(e: RawEvent): boolean {
-    if (!this.domainFilterActive) return true;
-    const host = getStr(e, 'domain') || (getStr(e, 'authority') || '').replace(/:\d+$/, '');
-    if (!host) return true;   // can't attribute → keep, never over-drop
-    return this.config.domains.some(d => hostMatchesDomain(host, d));
+    if (!this.config.domains || this.config.domains.length === 0) return '';
+    if (this.config.domains.length === 1) return `, authority="${this.config.domains[0]}"`;
+    return `, authority=~"${this.config.domains.join('|')}"`;
   }
 
   // ── Phase 1: collect WAF events ──
@@ -466,11 +417,7 @@ export class ProgressiveAnalysisJob {
     }, undefined, () => this.cancelled);
 
     const expectedVh = this.vhName;
-    const vhScoped = allEvents.filter(e => { const vh = getStr(e, 'vh_name'); return !vh || vh === expectedVh; });
-    const scoped = vhScoped.filter(e => this.eventInSelectedDomains(e)).filter(isWafEvent);
-    if (this.domainFilterActive) {
-      console.log(`[FP ${this.id}] domain scope [${this.config.domains.join(', ')}]: kept ${scoped.length}/${vhScoped.length} vh-scoped events`);
-    }
+    const scoped = allEvents.filter(e => { const vh = getStr(e, 'vh_name'); return !vh || vh === expectedVh; }).filter(isWafEvent);
     // Malicious bots are EXCLUDED from the analysed/comparison set: they're always req_risk High true
     // positives (no FP scoring needed) and the comparison reconstructs them from their count. When the
     // server filter was unavailable, the bots are still in `scoped` here, so drop them client-side and
@@ -600,7 +547,7 @@ export class ProgressiveAnalysisJob {
     } catch (e) {
       console.warn(`[FP ${this.id}] malicious-bot detail sample failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    return out.filter(e => this.eventInSelectedDomains(e)).slice(0, BOT_SAMPLE_CAP);
+    return out.slice(0, BOT_SAMPLE_CAP);
   }
 
   // ── Phase 2: index + collect flagged IPs + distinct paths ──
@@ -692,7 +639,6 @@ export class ProgressiveAnalysisJob {
           for (const log of normalizeEntries(raw)) {
             const ip = getStr(log, 'src_ip');
             if (!ip || !ipSet.has(ip)) continue;
-            if (!this.eventInSelectedDomains(log)) continue;
             const a = acc.get(ip)!;
             a.total++;
             const code = getStr(log, 'rsp_code') || '0';
@@ -783,7 +729,6 @@ export class ProgressiveAnalysisJob {
             }
           } catch { /* skip */ }
           for (const log of normalizeEntries(raw)) {
-            if (!this.eventInSelectedDomains(log)) continue;
             const p = getStr(log, 'req_path') || '/';
             const a = acc.get(p);
             if (!a) continue;

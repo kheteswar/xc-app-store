@@ -3,26 +3,17 @@
 @tailwind utilities;
 
 /* ==========================================================================
-   THEME PALETTES
-   Slate is remapped per theme; accent -300/-400 shades flip for contrast.
+   THEME PALETTES — 3 modes (Dark / Mid / Bright), 3 variants each.
+   The app is built on Tailwind `slate-*` + accent `-300/-400` classes; each
+   theme just remaps the CSS variables behind them. Variants override the
+   neutral scale; accents are shared per family (with a few per-variant tweaks).
+   Selected via [data-theme="<mode>"][data-variant="<1|2|3>"] on <html>.
    ========================================================================== */
 
-:root,
-[data-theme="dark"] {
-  /* ---- slate (original Tailwind) ---- */
-  --slate-50:  248 250 252;
-  --slate-100: 241 245 249;
-  --slate-200: 226 232 240;
-  --slate-300: 203 213 225;
-  --slate-400: 148 163 184;
-  --slate-500: 100 116 139;
-  --slate-600: 71 85 105;
-  --slate-700: 51 65 85;
-  --slate-800: 30 41 59;
-  --slate-900: 15 23 42;
-  --slate-950: 2 6 23;
-
-  /* ---- accent 300/400 (original Tailwind) ---- */
+/* ---- color-scheme + shared accents per family ---- */
+:root { color-scheme: dark; }
+[data-theme="dark"], [data-theme="warm"] {
+  color-scheme: dark;
   --blue-300: 147 197 253;   --blue-400: 96 165 250;
   --emerald-300: 110 231 183; --emerald-400: 52 211 153;
   --amber-300: 252 211 77;   --amber-400: 251 191 36;
@@ -33,25 +24,9 @@
   --yellow-300: 253 224 71;  --yellow-400: 250 204 21;
   --orange-300: 253 186 116; --orange-400: 251 146 60;
   --rose-300: 253 164 175;   --rose-400: 251 113 133;
-
-  color-scheme: dark;
 }
-
-/* ---------- LIGHT — F5 XC Distributed Cloud inspired ---------- */
 [data-theme="light"] {
-  --slate-50:  2 6 23;
-  --slate-100: 15 23 42;       /* primary text — dark navy */
-  --slate-200: 30 41 59;
-  --slate-300: 51 65 85;
-  --slate-400: 71 85 105;      /* muted text */
-  --slate-500: 100 116 139;
-  --slate-600: 203 213 225;    /* subtle borders */
-  --slate-700: 226 232 240;    /* borders */
-  --slate-800: 255 255 255;    /* white surfaces / cards */
-  --slate-900: 245 247 251;    /* page bg — slight blue-gray tint (F5 XC) */
-  --slate-950: 238 240 246;
-
-  /* accent → flip 300→700, 400→600 for readability on light bg */
+  color-scheme: light;
   --blue-300: 29 78 216;      --blue-400: 37 99 235;
   --emerald-300: 4 120 87;    --emerald-400: 5 150 105;
   --amber-300: 180 83 9;      --amber-400: 217 119 6;
@@ -62,72 +37,107 @@
   --yellow-300: 161 98 7;     --yellow-400: 202 138 4;
   --orange-300: 194 65 12;    --orange-400: 234 88 12;
   --rose-300: 190 18 60;      --rose-400: 225 29 72;
-
-  color-scheme: light;
 }
 
-/* ---------- WARM — cream / peach ---------- */
-[data-theme="warm"] {
-  --slate-50:  28 18 10;
-  --slate-100: 45 32 22;       /* primary text — warm dark brown */
-  --slate-200: 62 48 35;
-  --slate-300: 82 65 50;
-  --slate-400: 110 92 74;      /* muted text */
-  --slate-500: 148 130 112;
-  --slate-600: 205 192 176;    /* subtle borders */
-  --slate-700: 225 215 202;    /* borders */
-  --slate-800: 255 253 249;    /* warm-white surfaces */
-  --slate-900: 248 244 237;    /* page bg — warm cream */
-  --slate-950: 242 236 228;
+/* ================= DARK — deep, light text ================= */
+/* Dark 1 · Slate (default) */
+:root,
+[data-theme="dark"][data-variant="1"] {
+  --slate-50: 248 250 252; --slate-100: 241 245 249; --slate-200: 226 232 240;
+  --slate-300: 203 213 225; --slate-400: 148 163 184; --slate-500: 100 116 139;
+  --slate-600: 71 85 105; --slate-700: 51 65 85; --slate-800: 30 41 59;
+  --slate-900: 15 23 42; --slate-950: 2 6 23;
+}
+/* Dark 2 · Midnight (deep navy, richer) */
+[data-theme="dark"][data-variant="2"] {
+  --slate-50: 247 249 255; --slate-100: 236 240 252; --slate-200: 220 227 246;
+  --slate-300: 196 205 232; --slate-400: 150 162 196; --slate-500: 104 116 152;
+  --slate-600: 66 78 114; --slate-700: 42 52 82; --slate-800: 24 31 54;
+  --slate-900: 13 18 38; --slate-950: 8 11 24;
+}
+/* Dark 3 · Carbon (neutral charcoal, no blue) */
+[data-theme="dark"][data-variant="3"] {
+  --slate-50: 250 250 250; --slate-100: 244 244 245; --slate-200: 228 228 231;
+  --slate-300: 212 212 216; --slate-400: 161 161 170; --slate-500: 113 113 122;
+  --slate-600: 82 82 91; --slate-700: 63 63 70; --slate-800: 39 39 42;
+  --slate-900: 24 24 27; --slate-950: 9 9 11;
+}
 
-  /* accent → same contrast flip as light */
-  --blue-300: 29 78 216;      --blue-400: 37 99 235;
-  --emerald-300: 4 120 87;    --emerald-400: 5 150 105;
-  --amber-300: 180 83 9;      --amber-400: 217 119 6;
-  --cyan-300: 14 116 144;     --cyan-400: 8 145 178;
-  --violet-300: 109 40 217;   --violet-400: 124 58 237;
-  --red-300: 185 28 28;       --red-400: 220 38 38;
-  --green-300: 21 128 61;     --green-400: 22 163 74;
-  --yellow-300: 161 98 7;     --yellow-400: 202 138 4;
-  --orange-300: 194 65 12;    --orange-400: 234 88 12;
-  --rose-300: 190 18 60;      --rose-400: 225 29 72;
+/* ================= MID — dimmed / in-between, light text ================= */
+/* Mid 1 · Dusk (lifted slate, easy on eyes) */
+[data-theme="warm"][data-variant="1"] {
+  --slate-50: 246 248 251; --slate-100: 235 239 245; --slate-200: 216 222 232;
+  --slate-300: 194 201 214; --slate-400: 156 165 180; --slate-500: 116 125 141;
+  --slate-600: 82 91 106; --slate-700: 60 68 82; --slate-800: 44 51 62;
+  --slate-900: 33 39 49; --slate-950: 26 31 39;
+}
+/* Mid 2 · Sepia (warm charcoal, cozy) */
+[data-theme="warm"][data-variant="2"] {
+  --slate-50: 250 247 242; --slate-100: 242 237 230; --slate-200: 229 222 213;
+  --slate-300: 212 203 192; --slate-400: 176 165 151; --slate-500: 136 125 114;
+  --slate-600: 98 89 80; --slate-700: 74 67 60; --slate-800: 56 51 45;
+  --slate-900: 43 39 34; --slate-950: 34 31 27;
+  --amber-300: 252 214 120; --amber-400: 245 176 70;
+  --orange-300: 252 180 120; --orange-400: 244 150 80;
+}
+/* Mid 3 · Twilight (indigo dusk) */
+[data-theme="warm"][data-variant="3"] {
+  --slate-50: 248 249 255; --slate-100: 237 238 250; --slate-200: 220 222 244;
+  --slate-300: 200 202 230; --slate-400: 160 163 198; --slate-500: 120 123 160;
+  --slate-600: 86 89 126; --slate-700: 62 65 100; --slate-800: 45 47 74;
+  --slate-900: 33 35 55; --slate-950: 26 28 45;
+  --violet-300: 202 192 255; --violet-400: 172 150 252;
+  --blue-300: 160 195 255; --blue-400: 122 170 250;
+}
 
-  color-scheme: light;
+/* ================= BRIGHT — light bg, dark text ================= */
+/* Bright 1 · Cool Gray (crisp neutral) */
+[data-theme="light"][data-variant="1"] {
+  --slate-50: 2 6 23; --slate-100: 15 23 42; --slate-200: 30 41 59;
+  --slate-300: 51 65 85; --slate-400: 71 85 105; --slate-500: 108 122 143;
+  --slate-600: 205 212 222; --slate-700: 221 226 234; --slate-800: 255 255 255;
+  --slate-900: 239 242 247; --slate-950: 230 234 240;
+}
+/* Bright 2 · Airy White (high-key, minimal) */
+[data-theme="light"][data-variant="2"] {
+  --slate-50: 2 6 23; --slate-100: 17 24 39; --slate-200: 31 41 55;
+  --slate-300: 55 65 81; --slate-400: 88 98 116; --slate-500: 130 140 156;
+  --slate-600: 222 227 234; --slate-700: 233 237 243; --slate-800: 255 255 255;
+  --slate-900: 248 250 253; --slate-950: 240 243 248;
+}
+/* Bright 3 · Warm Paper (soft warm off-white) */
+[data-theme="light"][data-variant="3"] {
+  --slate-50: 23 18 14; --slate-100: 41 37 33; --slate-200: 57 52 47;
+  --slate-300: 78 71 64; --slate-400: 122 112 101; --slate-500: 156 144 131;
+  --slate-600: 214 206 195; --slate-700: 229 222 212; --slate-800: 255 253 249;
+  --slate-900: 245 241 234; --slate-950: 237 231 221;
+  --amber-300: 154 71 6;  --amber-400: 194 100 8;
+  --orange-300: 180 60 10; --orange-400: 217 79 12;
+  --red-300: 180 28 28;   --red-400: 200 35 35;
+  --yellow-300: 146 88 6; --yellow-400: 180 120 4;
+  --rose-300: 180 20 58;  --rose-400: 214 30 70;
 }
 
 /* ==========================================================================
-   LIGHT & WARM — depth, shadows, header
-   Outside @layer so they beat Tailwind utilities.
+   BRIGHT family — depth, shadows, header, scrollbars (beats Tailwind utils)
    ========================================================================== */
-
-/* Cards & panels — subtle resting shadow */
-[data-theme="light"] .rounded-xl.border,
-[data-theme="warm"] .rounded-xl.border {
-  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.06), 0 1px 2px -1px rgb(0 0 0 / 0.04);
+[data-theme="light"] .rounded-xl.border {
+  box-shadow: 0 1px 2px 0 rgb(15 23 42 / 0.05), 0 1px 3px 0 rgb(15 23 42 / 0.06);
 }
-[data-theme="light"] .rounded-xl.border:hover,
-[data-theme="warm"] .rounded-xl.border:hover {
-  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.07), 0 4px 6px -4px rgb(0 0 0 / 0.04);
+[data-theme="light"] .rounded-xl.border:hover {
+  box-shadow: 0 2px 4px -1px rgb(15 23 42 / 0.06), 0 12px 22px -8px rgb(15 23 42 / 0.12);
 }
-
-/* Rounded-lg panels (some tool pages use lg instead of xl) */
-[data-theme="light"] .rounded-lg.border,
-[data-theme="warm"] .rounded-lg.border {
-  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+[data-theme="light"] .rounded-lg.border {
+  box-shadow: 0 1px 2px 0 rgb(15 23 42 / 0.05);
 }
-
-/* Header — visible separator */
-[data-theme="light"] header,
-[data-theme="warm"] header {
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.06);
+[data-theme="light"] header {
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.05);
   border-bottom-color: rgb(var(--slate-700));
 }
-
-/* Footer — visible separator */
-[data-theme="light"] footer,
-[data-theme="warm"] footer {
-  border-top-color: rgb(var(--slate-700));
-}
+[data-theme="light"] footer { border-top-color: rgb(var(--slate-700)); }
+[data-theme="light"] ::-webkit-scrollbar-track { background-color: rgb(var(--slate-900)); }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background-color: rgb(var(--slate-600)); }
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background-color: rgb(var(--slate-500)); }
 
 /* ==========================================================================
    BASE STYLES

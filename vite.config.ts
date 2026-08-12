@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fpAnalyzerPlugin } from './server/fp-analyzer-plugin';
+import { workmgrPlugin } from './server/workmgr-plugin';
 import type { IncomingMessage, ServerResponse } from 'http';
 import dns from 'node:dns';
 import http from 'node:http';
@@ -561,6 +562,7 @@ export default defineConfig({
   plugins: [
     react(),
     fpAnalyzerPlugin(),
+    workmgrPlugin(),
     {
       name: 'f5xc-proxy',
       configureServer(server) {

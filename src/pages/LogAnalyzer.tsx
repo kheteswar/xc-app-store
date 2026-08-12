@@ -5,7 +5,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  ArrowLeft, BarChart2, Loader2, Play, Search, ExternalLink,
+  ArrowLeft, BarChart2, BarChart3, Loader2, Play, Search, ExternalLink,
   ChevronDown, ChevronUp, Plus, X, Download,
   Hash, Type, Filter, Table, FileJson, FileSpreadsheet,
   AlertTriangle, Zap, Shield, Users, HelpCircle,
@@ -25,9 +25,10 @@ import {
   type LogSummary, type AccessLogEntry, type BreakdownResult,
   type ErrorAnalysis, type PerformanceAnalysis, type SecurityInsights,
   type TopTalker, type StatusTimeSeriesPoint, type AggregatedLogData,
+  type AggBucket, type NumericAggResult, type NestedBreakdownEntry,
   TIME_PERIOD_HOURS, TIME_PERIOD_LABELS,
   FIELD_DEFINITIONS, PRE_FETCH_FILTER_FIELDS, FIELD_GROUP_LABELS, getFieldsForSource,
-  collectWithAggregations, buildQuery, probeLogs,
+  collectWithAggregations, collectWithAggregationsMulti, buildQuery, probeLogs,
   computeNumericStats, computeStringStats, computeBooleanStats,
   computeBreakdown, resolveField,
   computeSummary, applyClientFilters,
@@ -36,6 +37,8 @@ import {
   buildStringStatsFromBuckets, buildSummaryFromAggregations,
   buildErrorAnalysisFromAgg, buildSecurityInsightsFromAgg,
   buildTopTalkersFromAgg, buildStatusTimeSeriesFromAgg,
+  buildNumericStatsFromAgg, buildBreakdownFromNestedAggs,
+  fetchFieldAggregation, fetchNumericAggregations, fetchNestedBreakdown,
   exportAsJSON, exportAsCSV,
   exportBreakdownAsCSV, exportBreakdownAsExcel, exportBreakdownAsPDF,
 } from '../services/log-analyzer';
@@ -234,6 +237,107 @@ function MiniTable({ headers, rows, onRowClick }: {
   );
 }
 
+function NamespaceMultiSelect({ options, selected, onChange, placeholder }: {
+  options: string[];
+  selected: string[];
+  onChange: (v: string[]) => void;
+  placeholder: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [filter, setFilter] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setIsOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const filtered = options.filter(o => o.toLowerCase().includes(filter.toLowerCase()));
+  const toggle = (v: string) => {
+    if (selected.includes(v)) onChange(selected.filter(x => x !== v));
+    else onChange([...selected, v]);
+  };
+
+  const label = selected.length === 0
+    ? placeholder
+    : selected.length === 1
+    ? selected[0]
+    : `${selected.length} namespaces selected`;
+
+  return (
+    <div ref={ref} className="relative">
+      <label className="block text-xs font-medium text-slate-400 mb-1">
+        Namespace(s) {selected.length > 1 && <span className="text-blue-400">— multi-select mode</span>}
+      </label>
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-sm text-left flex items-center justify-between hover:bg-slate-600"
+      >
+        <span className={selected.length === 0 ? 'text-slate-500' : 'text-slate-200'}>{label}</span>
+        {isOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+      </button>
+      {isOpen && (
+        <div className="absolute z-30 mt-1 w-full bg-slate-800 border border-slate-700 rounded-lg shadow-xl max-h-96 overflow-hidden flex flex-col">
+          <div className="p-2 border-b border-slate-700 flex items-center gap-2">
+            <Search className="w-3.5 h-3.5 text-slate-500" />
+            <input
+              type="text"
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+              placeholder="Filter namespaces..."
+              className="flex-1 bg-transparent text-sm text-slate-200 focus:outline-none"
+              autoFocus
+            />
+            {selected.length > 0 && (
+              <button
+                type="button"
+                onClick={() => onChange([])}
+                className="text-xs text-slate-400 hover:text-slate-200 px-2 py-0.5 hover:bg-slate-700 rounded"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <div className="flex gap-2 px-2 pt-2 pb-1 text-xs">
+            <button
+              type="button"
+              onClick={() => onChange(filtered)}
+              className="text-blue-400 hover:text-blue-300 px-2 py-0.5 hover:bg-slate-700 rounded"
+              disabled={filtered.length === 0}
+            >
+              Select all ({filtered.length})
+            </button>
+          </div>
+          <div className="overflow-y-auto flex-1">
+            {filtered.length === 0 ? (
+              <div className="px-3 py-4 text-xs text-slate-500 text-center">No namespaces match</div>
+            ) : (
+              filtered.map(ns => (
+                <label
+                  key={ns}
+                  className="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-700 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.includes(ns)}
+                    onChange={() => toggle(ns)}
+                    className="w-4 h-4 accent-blue-500"
+                  />
+                  <span className="truncate">{ns}</span>
+                </label>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BreakdownMultiSelect({ groupedFields, groupLabels, selected, onChange, excludeField }: {
   groupedFields: Record<string, Array<{ key: string; label: string; type: string }>>;
   groupLabels: Record<string, string>;
@@ -329,23 +433,35 @@ function BreakdownRow({ entry, breakdownFields, isExpanded, onToggle }: {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {breakdownFields.map(bf => {
                   const subs = entry.breakdowns[bf.key] || [];
+                  // Denominator for % = primaryCount (each request has exactly one value for this field).
+                  // Fall back to sum of sub counts if primaryCount is missing or bucket coverage is partial.
+                  const subTotal = subs.reduce((s, x) => s + x.count, 0);
+                  const denom = entry.primaryCount > 0 ? entry.primaryCount : subTotal;
                   return (
                     <div key={bf.key}>
                       <div className="text-xs font-medium text-slate-400 mb-1.5">{bf.label} <span className="text-slate-600">({subs.length} unique)</span></div>
                       <div className="overflow-auto max-h-[250px]">
                         <table className="w-full text-xs">
                           <thead className="sticky top-0 bg-slate-900">
-                            <tr><th className="text-left py-1 px-2 text-slate-500">Value</th><th className="text-right py-1 px-2 text-slate-500">Count</th></tr>
+                            <tr>
+                              <th className="text-left py-1 px-2 text-slate-500">Value</th>
+                              <th className="text-right py-1 px-2 text-slate-500">Count</th>
+                              <th className="text-right py-1 px-2 text-slate-500">%</th>
+                            </tr>
                           </thead>
                           <tbody>
-                            {subs.slice(0, 30).map((s, i) => (
-                              <tr key={i} className="border-t border-slate-800 hover:bg-slate-800/50">
-                                <td className="py-0.5 px-2 text-slate-300 font-mono break-all">{s.value}</td>
-                                <td className="py-0.5 px-2 text-right text-slate-400">{s.count.toLocaleString()}</td>
-                              </tr>
-                            ))}
+                            {subs.slice(0, 30).map((s, i) => {
+                              const pct = denom > 0 ? (s.count / denom) * 100 : 0;
+                              return (
+                                <tr key={i} className="border-t border-slate-800 hover:bg-slate-800/50">
+                                  <td className="py-0.5 px-2 text-slate-300 font-mono break-all">{s.value}</td>
+                                  <td className="py-0.5 px-2 text-right text-slate-400">{s.count.toLocaleString()}</td>
+                                  <td className="py-0.5 px-2 text-right text-slate-500 tabular-nums">{pct.toFixed(pct < 1 ? 2 : 1)}%</td>
+                                </tr>
+                              );
+                            })}
                             {subs.length > 30 && (
-                              <tr><td colSpan={2} className="py-1 px-2 text-center text-slate-600 text-[10px]">...and {subs.length - 30} more</td></tr>
+                              <tr><td colSpan={3} className="py-1 px-2 text-center text-slate-600 text-[10px]">...and {subs.length - 30} more</td></tr>
                             )}
                           </tbody>
                         </table>
@@ -385,7 +501,10 @@ export function LogAnalyzer() {
 
   // ── Config ─────────────────────────────────────────────────────
   const [namespaces, setNamespaces] = useState<Namespace[]>([]);
-  const [selectedNs, setSelectedNs] = useState('');
+  const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
+  // Derived single-namespace (only when exactly one is selected — used for LB picker + probe)
+  const selectedNs = selectedNamespaces.length === 1 ? selectedNamespaces[0] : '';
+  const isMultiNs = selectedNamespaces.length > 1;
   const [loadBalancers, setLoadBalancers] = useState<{ name: string }[]>([]);
   const [selectedLb, setSelectedLb] = useState('');
   const [timePeriod, setTimePeriod] = useState<TimePeriod>('24h');
@@ -421,6 +540,39 @@ export function LogAnalyzer() {
   const FIELD_STATS_PAGE_SIZE = 25;
   const [breakdownResult, setBreakdownResult] = useState<BreakdownResult | null>(null);
   const [expandedPrimary, setExpandedPrimary] = useState<Set<string>>(new Set());
+
+  // ── On-demand aggregation cache & loading ──────────────────────
+  // Cache keys embed the analysis-run identity (aggData reference resets on new run),
+  // so switching time range / filters / namespace invalidates automatically.
+  const [fieldAggCache, setFieldAggCache] = useState<Map<string, AggBucket[]>>(new Map());
+  const [numericAggCache, setNumericAggCache] = useState<Map<string, NumericAggResult>>(new Map());
+  const [breakdownCache, setBreakdownCache] = useState<Map<string, NestedBreakdownEntry[]>>(new Map());
+  const [fieldAnalysisLoading, setFieldAnalysisLoading] = useState(false);
+  const [breakdownLoading, setBreakdownLoading] = useState(false);
+  const [breakdownProgress, setBreakdownProgress] = useState<{ done: number; total: number } | null>(null);
+
+  // Diagnostic — which path produced the current field-analysis result
+  const [fieldAnalysisSource, setFieldAnalysisSource] = useState<
+    | { kind: 'idle' }
+    | { kind: 'pre-fetch'; bucketCount: number }
+    | { kind: 'on-demand'; bucketCount: number; variantsTried?: number }
+    | { kind: 'sample'; sampleSize: number; reason: string }
+    | { kind: 'error'; message: string }
+  >({ kind: 'idle' });
+
+  // Auto-invalidate caches when aggData identity changes (new analysis run, or HMR-reset).
+  // Prevents stale empty-cache entries from a previous session masking a working API call.
+  const lastAggRunRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!aggData) return;
+    const runKey = `${aggData.namespace}|${aggData.query}|${aggData.startTime}|${aggData.endTime}`;
+    if (lastAggRunRef.current !== runKey) {
+      lastAggRunRef.current = runKey;
+      setFieldAggCache(new Map());
+      setNumericAggCache(new Map());
+      setBreakdownCache(new Map());
+    }
+  }, [aggData]);
 
   // ── Progress ───────────────────────────────────────────────────
   const [progress, setProgress] = useState<LogCollectionProgress>({
@@ -505,49 +657,223 @@ export function LogAnalyzer() {
     }
   }, [filteredLogs, aggData, showResults, timePeriod]);
 
-  // Field analysis — use aggregation buckets for string fields when available
+  // Field analysis — ALWAYS uses full-dataset aggregation.
+  //   1. Check pre-fetched aggData first (fast path — no new API call)
+  //   2. Otherwise fetch on-demand via variant-aware fetchFieldAggregation
+  //   3. If still empty, fall back to raw sample with clear label
+  //
+  // Cache keyed per (analysis-run × endpoint × field). Cleared on new run.
   useEffect(() => {
-    if (!showResults) return;
-    const def = FIELD_DEFINITIONS.find(f => f.key === selectedField);
-    if (!def) return;
-    if (def.type === 'numeric') {
-      // Numeric stats still need raw logs (need actual values for percentiles)
-      if (filteredLogs.length > 0) setNumericStats(computeNumericStats(filteredLogs, selectedField));
-      setStringStats(null);
-    } else if (def.type === 'boolean') {
-      if (aggData) {
-        const buckets = aggData.accessAggs[selectedField] ?? aggData.securityAggs[selectedField] ?? [];
-        if (buckets.length > 0) { setStringStats(buildStringStatsFromBuckets(buckets, selectedField, aggData.totalHits)); setNumericStats(null); return; }
-      }
-      if (filteredLogs.length > 0) setStringStats(computeBooleanStats(filteredLogs, selectedField));
-      setNumericStats(null);
-    } else {
-      // String field — prefer aggregation buckets (full dataset)
-      if (aggData) {
-        const buckets = aggData.accessAggs[selectedField] ?? aggData.securityAggs[selectedField] ?? [];
-        if (buckets.length > 0) { setStringStats(buildStringStatsFromBuckets(buckets, selectedField, aggData.totalHits)); setNumericStats(null); return; }
-      }
-      if (filteredLogs.length > 0) setStringStats(computeStringStats(filteredLogs, selectedField));
-      setNumericStats(null);
-    }
-  }, [filteredLogs, aggData, selectedField, showResults]);
-
-  // Breakdown computation
-  useEffect(() => {
-    if (filteredLogs.length === 0 || breakdownFields.length === 0) {
-      setBreakdownResult(null);
+    if (!showResults || !aggData) {
+      setFieldAnalysisSource({ kind: 'idle' });
       return;
     }
-    setBreakdownResult(computeBreakdown(filteredLogs, selectedField, breakdownFields));
-    setExpandedPrimary(new Set());
-  }, [filteredLogs, selectedField, breakdownFields]);
+    const def = FIELD_DEFINITIONS.find(f => f.key === selectedField);
+    if (!def) {
+      setFieldAnalysisSource({ kind: 'idle' });
+      return;
+    }
+
+    const endpoint = def.source === 'security' ? 'app_security/events' : 'access_logs';
+    const cacheKey = `${aggData.namespace}|${aggData.query}|${aggData.startTime}|${aggData.endTime}|${endpoint}|${selectedField}`;
+    // Multi-namespace mode: on-demand fetchers can't handle comma-joined namespaces —
+    // rely on pre-fetched aggData; if a field isn't pre-fetched, fall back to sample.
+    const isMultiNamespace = aggData.namespace.includes(',');
+
+    // Pre-fetched aggregation from collectWithAggregations (fast path)
+    const preFetched = aggData.accessAggs[selectedField] ?? aggData.securityAggs[selectedField] ?? null;
+
+    const renderStringFromBuckets = (buckets: AggBucket[], source: 'pre-fetch' | 'on-demand') => {
+      if (buckets.length > 0) {
+        setStringStats(buildStringStatsFromBuckets(buckets, selectedField, aggData.totalHits));
+        setNumericStats(null);
+        setFieldAnalysisSource({ kind: source, bucketCount: buckets.length });
+        return true;
+      }
+      return false;
+    };
+
+    const renderSampleFallback = (isBoolean: boolean, reason: string) => {
+      if (filteredLogs.length > 0) {
+        const s = isBoolean
+          ? computeBooleanStats(filteredLogs, selectedField)
+          : computeStringStats(filteredLogs, selectedField);
+        setStringStats({ ...s, label: `${s.label} (sample: ${filteredLogs.length})` });
+        setNumericStats(null);
+        setFieldAnalysisSource({ kind: 'sample', sampleSize: filteredLogs.length, reason });
+      } else {
+        setStringStats(null);
+        setNumericStats(null);
+        setFieldAnalysisSource({ kind: 'error', message: 'no data' });
+      }
+    };
+
+    let cancelled = false;
+    (async () => {
+      if (def.type === 'numeric') {
+        // Multi-namespace: on-demand numeric fetches don't work across namespaces — sample fallback
+        if (isMultiNamespace) {
+          if (filteredLogs.length > 0) {
+            const s = computeNumericStats(filteredLogs, selectedField);
+            setNumericStats({ ...s, label: `${s.label} (sample: ${filteredLogs.length})` });
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'sample', sampleSize: filteredLogs.length, reason: 'multi-namespace mode: numeric on-demand aggregation is not supported across namespaces' });
+          } else {
+            setFieldAnalysisSource({ kind: 'error', message: 'multi-namespace: no numeric data' });
+          }
+          return;
+        }
+        // Fast path: pre-fetched aggData rarely has numeric fields; go straight to on-demand
+        const cachedBuckets = fieldAggCache.get(cacheKey);
+        const cachedNumeric = numericAggCache.get(cacheKey);
+        if (cachedBuckets && cachedNumeric) {
+          if (cachedBuckets.length > 0 || cachedNumeric.avg !== null) {
+            setNumericStats(buildNumericStatsFromAgg(cachedBuckets, selectedField, cachedNumeric, aggData.totalHits));
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'on-demand', bucketCount: cachedBuckets.length });
+          } else if (filteredLogs.length > 0) {
+            const s = computeNumericStats(filteredLogs, selectedField);
+            setNumericStats({ ...s, label: `${s.label} (sample: ${filteredLogs.length})` });
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'sample', sampleSize: filteredLogs.length, reason: 'numeric aggregation returned no data (cached)' });
+          }
+          return;
+        }
+        setFieldAnalysisLoading(true);
+        try {
+          const [buckets, numeric] = await Promise.all([
+            fetchFieldAggregation(aggData.namespace, endpoint, aggData.query, aggData.startTime, aggData.endTime, selectedField, 1000),
+            fetchNumericAggregations(aggData.namespace, endpoint, aggData.query, aggData.startTime, aggData.endTime, selectedField),
+          ]);
+          if (cancelled) return;
+          setFieldAggCache(m => new Map(m).set(cacheKey, buckets));
+          setNumericAggCache(m => new Map(m).set(cacheKey, numeric));
+          if (buckets.length > 0 || numeric.avg !== null) {
+            setNumericStats(buildNumericStatsFromAgg(buckets, selectedField, numeric, aggData.totalHits));
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'on-demand', bucketCount: buckets.length });
+          } else if (filteredLogs.length > 0) {
+            const s = computeNumericStats(filteredLogs, selectedField);
+            setNumericStats({ ...s, label: `${s.label} (sample: ${filteredLogs.length})` });
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'sample', sampleSize: filteredLogs.length, reason: 'numeric aggregation returned no data' });
+          } else {
+            setNumericStats(null);
+            setStringStats(null);
+            setFieldAnalysisSource({ kind: 'error', message: 'no data' });
+          }
+        } catch (err) {
+          if (!cancelled) {
+            if (filteredLogs.length > 0) {
+              const s = computeNumericStats(filteredLogs, selectedField);
+              setNumericStats({ ...s, label: `${s.label} (sample: ${filteredLogs.length})` });
+              setStringStats(null);
+              setFieldAnalysisSource({ kind: 'sample', sampleSize: filteredLogs.length, reason: `numeric fetch error: ${(err as Error).message ?? 'unknown'}` });
+            } else {
+              setFieldAnalysisSource({ kind: 'error', message: (err as Error).message ?? 'unknown' });
+            }
+          }
+        } finally {
+          if (!cancelled) setFieldAnalysisLoading(false);
+        }
+        return;
+      }
+
+      // string / boolean
+      // 1) Try pre-fetched aggData
+      if (preFetched && renderStringFromBuckets(preFetched, 'pre-fetch')) return;
+
+      // 2) Try on-demand fetch with variants (cache first — but only cache non-empty)
+      const cached = fieldAggCache.get(cacheKey);
+      if (cached && cached.length > 0) {
+        renderStringFromBuckets(cached, 'on-demand');
+        return;
+      }
+      setFieldAnalysisLoading(true);
+      try {
+        const buckets = await fetchFieldAggregation(aggData.namespace, endpoint, aggData.query, aggData.startTime, aggData.endTime, selectedField, 100);
+        if (cancelled) return;
+        // Only cache non-empty results — empty may be transient (rate limit, proxy timeout, wrong variant)
+        if (buckets.length > 0) {
+          setFieldAggCache(m => new Map(m).set(cacheKey, buckets));
+          renderStringFromBuckets(buckets, 'on-demand');
+        } else {
+          renderSampleFallback(def.type === 'boolean', 'API returned empty buckets for all variants (see console for details)');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          renderSampleFallback(def.type === 'boolean', `fetch error: ${(err as Error).message ?? 'unknown'}`);
+        }
+      } finally {
+        if (!cancelled) setFieldAnalysisLoading(false);
+      }
+    })().catch(() => { if (!cancelled) setFieldAnalysisLoading(false); });
+
+    return () => { cancelled = true; };
+  }, [aggData, selectedField, showResults, fieldAggCache, numericAggCache, filteredLogs]);
+
+  // Breakdown — ALWAYS uses full-dataset N+1 nested aggregation on demand.
+  // 1 primary-field aggregation + (topPrimary × breakdownFields.length) secondary calls,
+  // controlled concurrency. Results cached per (analysis-run × primaryField × breakdownFields).
+  useEffect(() => {
+    if (!showResults || !aggData || breakdownFields.length === 0) {
+      setBreakdownResult(null);
+      setBreakdownProgress(null);
+      return;
+    }
+    const def = FIELD_DEFINITIONS.find(f => f.key === selectedField);
+    if (!def) return;
+
+    const endpoint = def.source === 'security' ? 'app_security/events' : 'access_logs';
+    const cacheKey = `${aggData.namespace}|${aggData.query}|${aggData.startTime}|${aggData.endTime}|${endpoint}|${selectedField}::${breakdownFields.slice().sort().join(',')}`;
+
+    const cached = breakdownCache.get(cacheKey);
+    if (cached) {
+      setBreakdownResult(buildBreakdownFromNestedAggs(cached, selectedField, breakdownFields));
+      setExpandedPrimary(new Set());
+      return;
+    }
+
+    let cancelled = false;
+    setBreakdownLoading(true);
+    setBreakdownProgress({ done: 0, total: 0 });
+    (async () => {
+      try {
+        const entries = await fetchNestedBreakdown(
+          aggData.namespace, endpoint, aggData.query, aggData.startTime, aggData.endTime,
+          selectedField, breakdownFields, 25, 50,
+          (done, total) => { if (!cancelled) setBreakdownProgress({ done, total }); },
+        );
+        if (cancelled) return;
+        setBreakdownCache(m => new Map(m).set(cacheKey, entries));
+        setBreakdownResult(buildBreakdownFromNestedAggs(entries, selectedField, breakdownFields));
+        setExpandedPrimary(new Set());
+      } finally {
+        if (!cancelled) {
+          setBreakdownLoading(false);
+          setBreakdownProgress(null);
+        }
+      }
+    })().catch(() => {
+      if (!cancelled) {
+        // Fall back to sample-based breakdown
+        if (filteredLogs.length > 0) {
+          setBreakdownResult(computeBreakdown(filteredLogs, selectedField, breakdownFields));
+        }
+        setBreakdownLoading(false);
+        setBreakdownProgress(null);
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [aggData, selectedField, breakdownFields, showResults, breakdownCache, filteredLogs]);
 
   // ═══════════════════════════════════════════════════════════════
   // ACTIONS
   // ═══════════════════════════════════════════════════════════════
 
   const handleAnalyze = useCallback(async () => {
-    if (!selectedNs || isRunning) return;
+    if (selectedNamespaces.length === 0 || isRunning) return;
     setIsRunning(true);
     setShowResults(false);
     setLogs([]);
@@ -556,29 +882,39 @@ export function LogAnalyzer() {
     setTablePage(0);
     setActiveTab('overview');
 
+    // Clear on-demand aggregation caches — new analysis run invalidates them
+    setFieldAggCache(new Map());
+    setNumericAggCache(new Map());
+    setBreakdownCache(new Map());
+    setNumericStats(null);
+    setStringStats(null);
+    setBreakdownResult(null);
+
     const endTime = new Date().toISOString();
     const startTime = new Date(Date.now() - TIME_PERIOD_HOURS[timePeriod] * 60 * 60 * 1000).toISOString();
 
-    // Build query with LB filter if selected
+    // Build query with LB filter if selected (single-namespace mode only)
     const allFilters = [...preFetchFilters];
-    if (selectedLb) {
+    if (selectedLb && !isMultiNs) {
       allFilters.push({ field: 'vh_name', value: `ves-io-http-loadbalancer-${selectedLb}` });
     }
     const query = buildQuery(allFilters);
 
     try {
-      // Aggregation-based fast path — replaces full raw log scrolling
-      const data = await collectWithAggregations(selectedNs, query, startTime, endTime, setProgress);
+      const data = isMultiNs
+        ? await collectWithAggregationsMulti(selectedNamespaces, query, startTime, endTime, setProgress)
+        : await collectWithAggregations(selectedNamespaces[0], query, startTime, endTime, setProgress);
       setAggData(data);
-      setLogs(data.sampleLogs); // sample for table view + latency
+      setLogs(data.sampleLogs);
       setShowResults(true);
 
+      const nsLabel = isMultiNs ? ` across ${selectedNamespaces.length} namespaces` : '';
       const sourceLabel = logSource === 'security'
         ? `${data.totalSecurityEvents.toLocaleString()} security events`
         : logSource === 'both'
         ? `~${data.estimatedRequests.toLocaleString()} requests · ${data.totalSecurityEvents.toLocaleString()} security events`
         : `~${data.estimatedRequests.toLocaleString()} requests`;
-      toast.success(`Analyzed ${sourceLabel} (${data.sampleLogs.length} in table)`);
+      toast.success(`Analyzed ${sourceLabel}${nsLabel} (${data.sampleLogs.length} in table)`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setProgress(p => ({ ...p, phase: 'error', error: msg }));
@@ -586,7 +922,7 @@ export function LogAnalyzer() {
     } finally {
       setIsRunning(false);
     }
-  }, [selectedNs, selectedLb, isRunning, timePeriod, logSource, preFetchFilters, toast]);
+  }, [selectedNamespaces, isMultiNs, selectedLb, isRunning, timePeriod, logSource, preFetchFilters, toast]);
 
   const addPreFetchFilter = () => {
     if (!newFilterField || !newFilterValue) return;
@@ -841,15 +1177,25 @@ export function LogAnalyzer() {
       {/* ── Config Panel ────────────────────────────────────── */}
       <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5 mb-6">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-          <SearchableSelect label="Namespace" options={namespaces.map(ns => ({ value: ns.name, label: ns.name }))} value={selectedNs}
-            onChange={v => { setSelectedNs(v); setSelectedLb(''); setPreFetchFilters([]); setShowResults(false); setLogs([]); }} placeholder="Select namespace..." />
+          <NamespaceMultiSelect
+            options={namespaces.map(ns => ns.name)}
+            selected={selectedNamespaces}
+            onChange={v => {
+              setSelectedNamespaces(v);
+              setSelectedLb('');
+              setPreFetchFilters([]);
+              setShowResults(false);
+              setLogs([]);
+            }}
+            placeholder="Select namespace(s)..."
+          />
           <SearchableSelect
-            label="Load Balancer (optional)"
+            label={isMultiNs ? 'Load Balancer (single-namespace only)' : 'Load Balancer (optional)'}
             options={[{ value: '', label: 'All Load Balancers' }, ...loadBalancers.map(lb => ({ value: lb.name, label: lb.name }))]}
             value={selectedLb}
             onChange={setSelectedLb}
-            placeholder="Type to search LBs..."
-            disabled={!selectedNs || loadBalancers.length === 0}
+            placeholder={isMultiNs ? 'Disabled in multi-namespace mode' : 'Type to search LBs...'}
+            disabled={!selectedNs || loadBalancers.length === 0 || isMultiNs}
           />
           <div>
             <label className="block text-xs font-medium text-slate-400 mb-1">Time Range</label>
@@ -917,9 +1263,9 @@ export function LogAnalyzer() {
             </button>
           </div>
         </div>
-        <button onClick={handleAnalyze} disabled={!selectedNs || isRunning}
+        <button onClick={handleAnalyze} disabled={selectedNamespaces.length === 0 || isRunning}
           className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white font-medium rounded-lg transition-colors">
-          {isRunning ? <><Loader2 className="w-5 h-5 animate-spin" /> Fetching {logSource === 'security' ? 'Security Events' : 'Logs'}...</> : <><Play className="w-5 h-5" /> Analyze {logSource === 'security' ? 'Security Events' : logSource === 'both' ? 'Logs + Security' : 'Logs'} — {TIME_PERIOD_LABELS[timePeriod]}</>}
+          {isRunning ? <><Loader2 className="w-5 h-5 animate-spin" /> Fetching {logSource === 'security' ? 'Security Events' : 'Logs'}...</> : <><Play className="w-5 h-5" /> Analyze {logSource === 'security' ? 'Security Events' : logSource === 'both' ? 'Logs + Security' : 'Logs'}{isMultiNs ? ` across ${selectedNamespaces.length} namespaces` : ''} — {TIME_PERIOD_LABELS[timePeriod]}</>}
         </button>
       </div>
 
@@ -941,16 +1287,89 @@ export function LogAnalyzer() {
       {/* ═══════════════════════════════════════════════════════ */}
       {showResults && summary && (
         <>
-          {/* Summary Cards */}
+          {/* Metrics API banner (14d / 30d — beyond access-log retention) */}
+          {aggData?.metricsPathActive && aggData.metricsSummary && (
+            <div className="mb-4 bg-amber-500/5 border border-amber-500/30 rounded-xl p-4">
+              <div className="flex items-start gap-3">
+                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-amber-500/20 flex items-center justify-center">
+                  <span className="text-amber-400 text-lg">📊</span>
+                </div>
+                <div className="flex-1">
+                  <div className="text-sm font-semibold text-amber-300 mb-1">
+                    Extended window mode — using F5 XC metrics API (Performance-dashboard data)
+                  </div>
+                  <div className="text-xs text-amber-200/80 leading-relaxed">
+                    Window &gt; 7 days exceeds typical access-log retention. Totals, error rates, latency percentiles,
+                    and time-series come from <code className="text-amber-300 bg-amber-500/10 px-1 rounded">graph/service</code>
+                    (30-90d retention). <span className="text-amber-300 font-medium">Arbitrary field breakdowns (top domains, IPs,
+                    countries, browser types, TLS versions) are NOT available beyond retention</span> — those tabs will show
+                    limited or empty data at 14d/30d.
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Summary Cards — metrics-API mode uses metrics numbers */}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-            <StatCard label="Total Logs" value={summary.totalLogs} />
-            <StatCard label="Unique IPs" value={summary.uniqueIPs} />
-            <StatCard label="Unique Paths" value={summary.uniquePaths} />
-            <StatCard label="Unique Domains" value={summary.uniqueDomains} />
-            <StatCard label="Avg Duration" value={`${(summary.avgDurationMs || 0).toFixed(1)}ms`} />
-            <StatCard label="Error Rate" value={`${summary.errorRate.toFixed(1)}%`} sub="4xx + 5xx"
-              color={summary.errorRate > 10 ? 'text-red-400' : summary.errorRate > 5 ? 'text-amber-400' : 'text-emerald-400'} />
+            {aggData?.metricsPathActive && aggData.metricsSummary ? (
+              <>
+                <StatCard label="Total Requests" value={aggData.metricsSummary.totalRequests} sub="from metrics API" />
+                <StatCard label="Total Errors" value={aggData.metricsSummary.totalErrors} sub="4xx + 5xx" color="text-red-400" />
+                <StatCard label="Error Rate" value={`${aggData.metricsSummary.errorRatePct.toFixed(2)}%`}
+                  color={aggData.metricsSummary.errorRatePct > 10 ? 'text-red-400' : aggData.metricsSummary.errorRatePct > 5 ? 'text-amber-400' : 'text-emerald-400'} />
+                <StatCard label="Avg Latency" value={`${aggData.metricsSummary.avgLatencyMs.toFixed(0)}ms`} />
+                <StatCard label="P95 Latency" value={`${aggData.metricsSummary.p90LatencyMs.toFixed(0)}ms`} sub="P90 (as proxy)" />
+                <StatCard label="P99 Latency" value={`${aggData.metricsSummary.p99LatencyMs.toFixed(0)}ms`} />
+              </>
+            ) : (
+              <>
+                <StatCard label="Total Logs" value={summary.totalLogs} />
+                <StatCard label="Unique IPs" value={summary.uniqueIPs} />
+                <StatCard label="Unique Paths" value={summary.uniquePaths} />
+                <StatCard label="Unique Domains" value={summary.uniqueDomains} />
+                <StatCard label="Avg Duration" value={`${(summary.avgDurationMs || 0).toFixed(1)}ms`} />
+                <StatCard label="Error Rate" value={`${summary.errorRate.toFixed(1)}%`} sub="4xx + 5xx"
+                  color={summary.errorRate > 10 ? 'text-red-400' : summary.errorRate > 5 ? 'text-amber-400' : 'text-emerald-400'} />
+              </>
+            )}
           </div>
+
+          {/* Per-LB breakdown (metrics API only) */}
+          {aggData?.metricsPathActive && aggData.metricsSummary && aggData.metricsSummary.perLB.length > 0 && (
+            <div className="bg-slate-800/50 border border-slate-700 rounded-xl mb-6 overflow-hidden">
+              <div className="px-5 py-3 text-sm font-semibold text-slate-200 border-b border-slate-700 flex items-center gap-2">
+                <BarChart3 className="w-4 h-4 text-blue-400" />
+                Per-Load-Balancer breakdown ({aggData.metricsSummary.perLB.length} LB{aggData.metricsSummary.perLB.length !== 1 ? 's' : ''})
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-800/60 text-slate-400 text-xs uppercase">
+                    <tr>
+                      <th className="px-4 py-2 text-left">Load Balancer (vhost)</th>
+                      <th className="px-4 py-2 text-right">Requests</th>
+                      <th className="px-4 py-2 text-right">Errors</th>
+                      <th className="px-4 py-2 text-right">Error %</th>
+                      <th className="px-4 py-2 text-right">P99 Latency</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {aggData.metricsSummary.perLB.slice(0, 50).map((lb) => (
+                      <tr key={lb.vhost} className="border-t border-slate-700/50 hover:bg-slate-800/40">
+                        <td className="px-4 py-2 font-mono text-xs text-slate-200 truncate max-w-md">{lb.vhost}</td>
+                        <td className="px-4 py-2 text-right text-slate-200">{lb.totalRequests.toLocaleString()}</td>
+                        <td className="px-4 py-2 text-right text-red-300">{lb.totalErrors.toLocaleString()}</td>
+                        <td className={`px-4 py-2 text-right ${lb.errorRatePct > 10 ? 'text-red-400' : lb.errorRatePct > 5 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                          {lb.errorRatePct.toFixed(2)}%
+                        </td>
+                        <td className="px-4 py-2 text-right text-slate-400">{lb.p99LatencyMs.toFixed(0)}ms</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* ── Slice & Dice ────────────────────────────────── */}
           <div className="bg-slate-800/50 border border-slate-700 rounded-xl mb-6">
@@ -1429,6 +1848,50 @@ export function LogAnalyzer() {
                     );
                   })}
                   <button onClick={() => setBreakdownFields([])} className="text-xs text-slate-500 hover:text-slate-300 px-2">Clear all</button>
+                </div>
+              )}
+
+              {/* On-demand fetch loading indicator (field analysis) */}
+              {fieldAnalysisLoading && (
+                <div className="flex items-center gap-2 px-3 py-2 mb-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-300">
+                  <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                  <span>Fetching full-dataset aggregation for {FIELD_DEFINITIONS.find(f => f.key === selectedField)?.label || selectedField}…</span>
+                </div>
+              )}
+
+              {/* On-demand breakdown loading indicator */}
+              {breakdownLoading && (
+                <div className="flex items-center gap-2 px-3 py-2 mb-3 bg-violet-500/10 border border-violet-500/30 rounded-lg text-xs text-violet-300">
+                  <div className="w-3 h-3 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
+                  <span>
+                    Cross-tabulating on full dataset
+                    {breakdownProgress && breakdownProgress.total > 0
+                      ? ` — ${breakdownProgress.done}/${breakdownProgress.total} aggregations`
+                      : '…'}
+                  </span>
+                </div>
+              )}
+
+              {/* Diagnostic badge — which path produced the current result */}
+              {!fieldAnalysisLoading && fieldAnalysisSource.kind !== 'idle' && (
+                <div className={`flex items-start gap-2 px-3 py-2 mb-3 rounded-lg text-xs border ${
+                  fieldAnalysisSource.kind === 'pre-fetch' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' :
+                  fieldAnalysisSource.kind === 'on-demand' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' :
+                  fieldAnalysisSource.kind === 'sample' ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' :
+                  'bg-red-500/10 border-red-500/30 text-red-300'
+                }`}>
+                  <span className="font-semibold">
+                    {fieldAnalysisSource.kind === 'pre-fetch' && `🟢 Full dataset (pre-fetched, ${fieldAnalysisSource.bucketCount} buckets)`}
+                    {fieldAnalysisSource.kind === 'on-demand' && `🟢 Full dataset (on-demand, ${fieldAnalysisSource.bucketCount} buckets)`}
+                    {fieldAnalysisSource.kind === 'sample' && `🟡 Sample only (${fieldAnalysisSource.sampleSize.toLocaleString()} logs)`}
+                    {fieldAnalysisSource.kind === 'error' && `🔴 No data`}
+                  </span>
+                  {fieldAnalysisSource.kind === 'sample' && (
+                    <span className="text-amber-400/80">— {fieldAnalysisSource.reason}</span>
+                  )}
+                  {fieldAnalysisSource.kind === 'error' && (
+                    <span className="text-red-400/80">— {fieldAnalysisSource.message}</span>
+                  )}
                 </div>
               )}
 

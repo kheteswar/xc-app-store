@@ -1168,7 +1168,6 @@ export default function FPAnalyzer() {
           namespace: selectedNs,
           lbName: selectedLb,
           domains: selectedDomains,
-          allDomains: domains,
           scopes,
           hoursBack,
         }),

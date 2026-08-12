@@ -7,6 +7,10 @@ import type { QueryFilter, LogCollectionProgress, AggregatedLogData } from './ty
 import {
   probeVolume, fetchBatchAggregation, scanHourlyVolume,
 } from './aggregation-client';
+import { fetchMetricSummary } from './metrics-client';
+
+/** Window size above which we switch to the metrics API for totals (access logs typically retained 7d). */
+const METRICS_API_THRESHOLD_HOURS = 168;
 
 // ═══════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -527,9 +531,24 @@ export async function collectWithAggregations(
 
   const rangeHours = (new Date(endTime).getTime() - new Date(startTime).getTime()) / 3600000;
   const bucketHours = rangeHours <= 1 ? 1 : rangeHours <= 24 ? 1 : rangeHours <= 168 ? 6 : 24;
+  const useMetricsApi = rangeHours > METRICS_API_THRESHOLD_HOURS;
 
-  // Phase 1: parallel — probe + both batch aggregations + raw sample
-  onProgress({ phase: 'fetching', message: 'Running server-side aggregations...', progress: 15, logsCollected: 0, estimatedTotal: 0 });
+  // Extract vhost filter (if user selected a specific LB) — for per-LB metrics.
+  // The query is of form `{vh_name="ves-io-http-loadbalancer-<lb>"}` — pull the value.
+  let vhostFilter: string | undefined;
+  const vhMatch = /vh_name\s*=\s*"([^"]+)"/.exec(query);
+  if (vhMatch) vhostFilter = vhMatch[1];
+
+  // Phase 1: parallel — probe + both batch aggregations + raw sample [+ metrics if needed]
+  onProgress({
+    phase: 'fetching',
+    message: useMetricsApi
+      ? `Running metrics API (${rangeHours.toFixed(0)}h > 7d — access-log retention limit)…`
+      : 'Running server-side aggregations...',
+    progress: 15,
+    logsCollected: 0,
+    estimatedTotal: 0,
+  });
 
   const [
     accessProbe,
@@ -538,6 +557,7 @@ export async function collectWithAggregations(
     securityAggs,
     rawSampleResp,
     rawSecSampleResp,
+    metricsSummary,
   ] = await Promise.all([
     probeVolume(namespace, 'access_logs', query, startTime, endTime),
     probeVolume(namespace, 'app_security/events', query, startTime, endTime),
@@ -553,42 +573,68 @@ export async function collectWithAggregations(
       `/api/data/namespaces/${namespace}/app_security/events`,
       { query, namespace, start_time: startTime, end_time: endTime, scroll: false, limit: 200, sort: 'DESCENDING' }
     ).catch(() => ({ events: [] } as SecurityEventResponse)),
+    // Metrics API (only for windows > 7d — this is what F5 XC's Performance dashboard uses)
+    useMetricsApi
+      ? fetchMetricSummary(namespace, startTime, endTime, vhostFilter).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.warn('[LogAnalyzer] Metrics API failed:', err);
+          return null;
+        })
+      : Promise.resolve(null),
   ]);
 
   onProgress({ phase: 'fetching', message: 'Building time series...', progress: 70, logsCollected: accessProbe.totalHits, estimatedTotal: accessProbe.totalHits });
 
-  // Phase 2: hourly time series (lightweight probes)
-  const hourlyBuckets = await scanHourlyVolume(
-    namespace, 'access_logs', query, startTime, endTime, bucketHours,
-    (done, total) => {
-      const pct = 70 + Math.round((done / total) * 25);
-      onProgress({ phase: 'fetching', message: `Time series: ${done}/${total} buckets`, progress: pct, logsCollected: accessProbe.totalHits, estimatedTotal: accessProbe.totalHits });
-    },
-  );
+  // Phase 2: hourly time series (skip when metrics API already provided one)
+  let timeSeries: Array<{ timestamp: string; count: number; label: string }>;
+  if (useMetricsApi && metricsSummary) {
+    // Convert metrics-API time series to the same shape
+    timeSeries = metricsSummary.timeSeries.map(p => ({
+      timestamp: new Date(p.timestamp).toISOString(),
+      count: p.requests,
+      label: p.label,
+    }));
+    onProgress({ phase: 'fetching', message: 'Time series from metrics API', progress: 95, logsCollected: metricsSummary.totalRequests, estimatedTotal: metricsSummary.totalRequests });
+  } else {
+    const hourlyBuckets = await scanHourlyVolume(
+      namespace, 'access_logs', query, startTime, endTime, bucketHours,
+      (done, total) => {
+        const pct = 70 + Math.round((done / total) * 25);
+        onProgress({ phase: 'fetching', message: `Time series: ${done}/${total} buckets`, progress: pct, logsCollected: accessProbe.totalHits, estimatedTotal: accessProbe.totalHits });
+      },
+    );
+    timeSeries = hourlyBuckets.map(b => ({
+      timestamp: b.start,
+      count: b.totalHits,
+      label: b.label,
+    }));
+  }
 
   const sampleLogs = normalizeLogEntries<AccessLogEntry>(rawSampleResp.logs ?? [], 'agg-sample');
   const sampleSecurityEvents = normalizeLogEntries<SecurityEventEntry>(rawSecSampleResp.events ?? [], 'agg-sec-sample');
 
-  const timeSeries = hourlyBuckets.map(b => ({
-    timestamp: b.start,
-    count: b.totalHits,
-    label: b.label,
-  }));
+  // Prefer metrics-API total for long windows; fall back to probe otherwise.
+  const metricsPathActive = useMetricsApi && !!metricsSummary && metricsSummary.totalRequests > 0;
+  const effectiveTotalHits = metricsPathActive
+    ? metricsSummary!.totalRequests
+    : accessProbe.totalHits;
 
   const estimatedRequests = accessProbe.sampleRate > 0 && accessProbe.sampleRate < 1
-    ? Math.round(accessProbe.totalHits / accessProbe.sampleRate)
-    : accessProbe.totalHits;
+    ? Math.round(effectiveTotalHits / accessProbe.sampleRate)
+    : effectiveTotalHits;
 
   onProgress({
     phase: 'complete',
-    message: `Complete: ~${estimatedRequests.toLocaleString()} requests · ${accessProbe.totalHits.toLocaleString()} sampled · ${sampleLogs.length} in table`,
+    message: metricsPathActive
+      ? `Complete (metrics API): ~${effectiveTotalHits.toLocaleString()} requests across ${metricsSummary!.perLB.length} LB(s) · ${sampleLogs.length} in table`
+      : `Complete: ~${estimatedRequests.toLocaleString()} requests · ${accessProbe.totalHits.toLocaleString()} sampled · ${sampleLogs.length} in table`,
     progress: 100,
-    logsCollected: accessProbe.totalHits,
-    estimatedTotal: accessProbe.totalHits,
+    logsCollected: effectiveTotalHits,
+    estimatedTotal: effectiveTotalHits,
   });
 
   return {
-    totalHits: accessProbe.totalHits,
+    totalHits: effectiveTotalHits,
     sampleRate: accessProbe.sampleRate,
     estimatedRequests,
     accessAggs,
@@ -597,6 +643,232 @@ export async function collectWithAggregations(
     sampleSecurityEvents,
     timeSeries,
     totalSecurityEvents: secProbe.totalHits,
+    namespace,
+    query,
+    startTime,
+    endTime,
+    metricsSummary: metricsSummary ?? null,
+    metricsPathActive,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MULTI-NAMESPACE COLLECTOR
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Run collectWithAggregations across multiple namespaces and merge the results.
+ *
+ * Merge semantics:
+ *   - totalHits / totalSecurityEvents: summed
+ *   - sampleRate: first non-1 value (assumed uniform per LB, may differ across namespaces)
+ *   - accessAggs / securityAggs: per-field buckets summed by key, resorted desc, top-N kept
+ *   - timeSeries: summed per timestamp
+ *   - sampleLogs / sampleSecurityEvents: concatenated (each entry tagged with `namespace`), truncated to 500 / 200
+ *   - metricsSummary (14d/30d hybrid): summed totals, merged perLB, averaged latencies
+ *
+ * Field-analysis on-demand fetches still use `aggData.namespace` — for multi-namespace runs
+ * this is set to a synthetic comma-joined value; downstream fetchers must handle multi-namespace
+ * separately (deferred: on-demand fetch will fall back to sample for multi-namespace runs).
+ */
+export async function collectWithAggregationsMulti(
+  namespaces: string[],
+  query: string,
+  startTime: string,
+  endTime: string,
+  onProgress: (p: LogCollectionProgress) => void,
+): Promise<AggregatedLogData> {
+  if (namespaces.length === 0) throw new Error('At least one namespace is required');
+  if (namespaces.length === 1) {
+    return collectWithAggregations(namespaces[0], query, startTime, endTime, onProgress);
+  }
+
+  const uniqueNs = Array.from(new Set(namespaces));
+  const perNs: AggregatedLogData[] = new Array(uniqueNs.length);
+  let completed = 0;
+
+  onProgress({
+    phase: 'fetching',
+    message: `Collecting across ${uniqueNs.length} namespaces in parallel...`,
+    progress: 5,
+    logsCollected: 0,
+    estimatedTotal: 0,
+  });
+
+  // Sub-progress reporter with a shared aggregate view
+  const perNsProgress = () => {
+    onProgress({
+      phase: 'fetching',
+      message: `Collecting across namespaces: ${completed}/${uniqueNs.length} done`,
+      progress: 5 + Math.round((completed / uniqueNs.length) * 90),
+      logsCollected: perNs.reduce((s, d) => s + (d?.totalHits ?? 0), 0),
+      estimatedTotal: 0,
+    });
+  };
+
+  await Promise.all(uniqueNs.map(async (ns, idx) => {
+    try {
+      perNs[idx] = await collectWithAggregations(ns, query, startTime, endTime, () => {
+        // Suppress per-ns progress noise; we report our own aggregated progress above.
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[LogAnalyzer] Multi-namespace collect failed for ns='${ns}':`, err);
+      // Use an empty data placeholder so merging can proceed
+      perNs[idx] = {
+        totalHits: 0, sampleRate: 1, estimatedRequests: 0,
+        accessAggs: {}, securityAggs: {},
+        sampleLogs: [], sampleSecurityEvents: [],
+        timeSeries: [], totalSecurityEvents: 0,
+        namespace: ns, query, startTime, endTime,
+        metricsSummary: null, metricsPathActive: false,
+      };
+    } finally {
+      completed++;
+      perNsProgress();
+    }
+  }));
+
+  // ── Merge ─────────────────────────────────────────────────────
+  const totalHits = perNs.reduce((s, d) => s + d.totalHits, 0);
+  const totalSecurityEvents = perNs.reduce((s, d) => s + d.totalSecurityEvents, 0);
+  const sampleRate = perNs.find(d => d.sampleRate !== 1)?.sampleRate ?? 1;
+
+  // Merge field aggregations — sum counts per key across namespaces, re-sort, keep top 100
+  const mergeBucketMap = (all: Array<Record<string, Array<{ key: string; count: number }>>>): Record<string, Array<{ key: string; count: number }>> => {
+    const merged: Record<string, Array<{ key: string; count: number }>> = {};
+    const fieldNames = new Set<string>();
+    for (const m of all) for (const k of Object.keys(m)) fieldNames.add(k);
+    for (const field of fieldNames) {
+      const counts = new Map<string, number>();
+      for (const m of all) for (const b of m[field] ?? []) counts.set(b.key, (counts.get(b.key) || 0) + b.count);
+      merged[field] = [...counts.entries()]
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 100);
+    }
+    return merged;
+  };
+  const accessAggs = mergeBucketMap(perNs.map(d => d.accessAggs));
+  const securityAggs = mergeBucketMap(perNs.map(d => d.securityAggs));
+
+  // Merge time series — sum counts by timestamp
+  const tsMap = new Map<string, { count: number; label: string }>();
+  for (const d of perNs) {
+    for (const p of d.timeSeries) {
+      const existing = tsMap.get(p.timestamp);
+      if (existing) existing.count += p.count;
+      else tsMap.set(p.timestamp, { count: p.count, label: p.label });
+    }
+  }
+  const timeSeries = [...tsMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([timestamp, { count, label }]) => ({ timestamp, count, label }));
+
+  // Concat sample logs — tag each with its namespace, sort by @timestamp desc, cap at 500
+  const taggedLogs: AccessLogEntry[] = [];
+  for (const d of perNs) {
+    for (const l of d.sampleLogs) taggedLogs.push({ ...l, namespace: d.namespace } as AccessLogEntry);
+  }
+  taggedLogs.sort((a, b) => {
+    const ta = String((a as Record<string, unknown>)['@timestamp'] ?? '');
+    const tb = String((b as Record<string, unknown>)['@timestamp'] ?? '');
+    return tb.localeCompare(ta);
+  });
+  const sampleLogs = taggedLogs.slice(0, 500);
+
+  const taggedSecEvents: SecurityEventEntry[] = [];
+  for (const d of perNs) {
+    for (const e of d.sampleSecurityEvents) taggedSecEvents.push({ ...e, namespace: d.namespace } as SecurityEventEntry);
+  }
+  taggedSecEvents.sort((a, b) => {
+    const ta = String((a as Record<string, unknown>)['@timestamp'] ?? '');
+    const tb = String((b as Record<string, unknown>)['@timestamp'] ?? '');
+    return tb.localeCompare(ta);
+  });
+  const sampleSecurityEvents = taggedSecEvents.slice(0, 200);
+
+  // Merge metrics summary — sum totals, merge per-LB, average latencies
+  const metricsChunks = perNs.map(d => d.metricsSummary).filter(Boolean) as import('./metrics-client').MetricSummary[];
+  let metricsSummary: import('./metrics-client').MetricSummary | null = null;
+  const metricsPathActive = metricsChunks.length > 0;
+
+  if (metricsPathActive) {
+    const totalRequests = metricsChunks.reduce((s, m) => s + m.totalRequests, 0);
+    const totalErrors4xx = metricsChunks.reduce((s, m) => s + m.totalErrors4xx, 0);
+    const totalErrors5xx = metricsChunks.reduce((s, m) => s + m.totalErrors5xx, 0);
+    const totalErrors = totalErrors4xx + totalErrors5xx;
+    const errorRatePct = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
+
+    // Weighted latencies by request count
+    const weightedAvg = (getVal: (m: import('./metrics-client').MetricSummary) => number): number => {
+      const w = metricsChunks.reduce((s, m) => s + m.totalRequests, 0);
+      if (w === 0) return 0;
+      return metricsChunks.reduce((s, m) => s + getVal(m) * m.totalRequests, 0) / w;
+    };
+    const avgLatencyMs = weightedAvg(m => m.avgLatencyMs);
+    const p50LatencyMs = weightedAvg(m => m.p50LatencyMs);
+    const p90LatencyMs = weightedAvg(m => m.p90LatencyMs);
+    const p99LatencyMs = weightedAvg(m => m.p99LatencyMs);
+
+    // perLB: concat + tag with namespace prefix
+    const perLB = metricsChunks.flatMap((m, i) => {
+      const ns = uniqueNs.find((_n, idx) => perNs[idx]?.metricsSummary === m) ?? '';
+      return m.perLB.map(lb => ({ ...lb, vhost: ns ? `${ns} / ${lb.vhost}` : lb.vhost }));
+      void i;
+    }).sort((a, b) => b.totalRequests - a.totalRequests);
+
+    // Time series: sum per timestamp
+    const tsAgg = new Map<number, { requests: number; errors: number; label: string }>();
+    for (const m of metricsChunks) {
+      for (const p of m.timeSeries) {
+        const existing = tsAgg.get(p.timestamp);
+        if (existing) { existing.requests += p.requests; existing.errors += p.errors; }
+        else tsAgg.set(p.timestamp, { requests: p.requests, errors: p.errors, label: p.label });
+      }
+    }
+    const mergedTs = [...tsAgg.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([timestamp, { requests, errors, label }]) => ({ timestamp, requests, errors, label }));
+
+    metricsSummary = {
+      totalRequests, totalErrors, totalErrors4xx, totalErrors5xx, errorRatePct,
+      avgLatencyMs, p50LatencyMs, p90LatencyMs, p99LatencyMs,
+      perLB, timeSeries: mergedTs,
+      step: metricsChunks[0].step,
+    };
+  }
+
+  const estimatedRequests = sampleRate > 0 && sampleRate < 1
+    ? Math.round(totalHits / sampleRate)
+    : totalHits;
+
+  onProgress({
+    phase: 'complete',
+    message: `Complete: ~${estimatedRequests.toLocaleString()} requests across ${uniqueNs.length} namespaces · ${sampleLogs.length} in table`,
+    progress: 100,
+    logsCollected: totalHits,
+    estimatedTotal: totalHits,
+  });
+
+  return {
+    totalHits,
+    sampleRate,
+    estimatedRequests,
+    accessAggs,
+    securityAggs,
+    sampleLogs,
+    sampleSecurityEvents,
+    timeSeries,
+    totalSecurityEvents,
+    // Composite namespace label — used for cache-key + display; on-demand fetchers see this and
+    // gracefully fall back to sample when they can't split it back into individual namespaces.
+    namespace: uniqueNs.join(','),
+    query,
+    startTime,
+    endTime,
+    metricsSummary,
+    metricsPathActive,
   };
 }
 

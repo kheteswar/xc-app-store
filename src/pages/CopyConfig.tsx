@@ -25,13 +25,143 @@ import { apiClient } from '../services/api';
 import { F5XCApiClient } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
-import type { Namespace, AlertReceiver, AlertPolicy, CDNCacheRule, ConfigObjectType } from '../types';
+import type { Namespace, AlertReceiver, AlertPolicy, CDNCacheRule } from '../types';
 
 type CopyMode = 'cross-tenant' | 'cross-namespace';
 type Step = 1 | 2 | 3 | 4;
 
+// Every namespaced F5 XC config object the tool can copy. `path` is the API
+// segment (/api/config/namespaces/<ns>/<path>). XC uses the "...policys" spelling.
+type CopyType =
+  | 'http_loadbalancer' | 'tcp_loadbalancer' | 'cdn_loadbalancer'
+  | 'origin_pool' | 'healthcheck'
+  | 'app_firewall' | 'service_policy' | 'service_policy_set' | 'rate_limiter' | 'rate_limiter_policy'
+  | 'bot_defense_policy' | 'api_definition' | 'malicious_user_mitigation' | 'user_identification' | 'forward_proxy_policy'
+  | 'ip_prefix_set' | 'bgp_asn_set'
+  | 'dns_zone' | 'dns_load_balancer'
+  | 'virtual_site'
+  | 'alert_receiver' | 'alert_policy' | 'global_log_receiver'
+  | 'cdn_cache_rule'
+  | 'certificate' | 'trusted_ca_list';
+
+const API_PATHS: Record<CopyType, string> = {
+  http_loadbalancer: 'http_loadbalancers', tcp_loadbalancer: 'tcp_loadbalancers', cdn_loadbalancer: 'cdn_loadbalancers',
+  origin_pool: 'origin_pools', healthcheck: 'healthchecks',
+  app_firewall: 'app_firewalls', service_policy: 'service_policys', service_policy_set: 'service_policy_sets',
+  rate_limiter: 'rate_limiters', rate_limiter_policy: 'rate_limiter_policys',
+  bot_defense_policy: 'bot_defense_policys', api_definition: 'api_definitions', malicious_user_mitigation: 'malicious_user_mitigations',
+  user_identification: 'user_identifications', forward_proxy_policy: 'forward_proxy_policys',
+  ip_prefix_set: 'ip_prefix_sets', bgp_asn_set: 'bgp_asn_sets',
+  dns_zone: 'dns_zones', dns_load_balancer: 'dns_load_balancers',
+  virtual_site: 'virtual_sites',
+  alert_receiver: 'alert_receivers', alert_policy: 'alert_policys', global_log_receiver: 'global_log_receivers',
+  cdn_cache_rule: 'cdn_cache_rules',
+  certificate: 'certificates', trusted_ca_list: 'trusted_ca_lists',
+};
+
+const TYPE_LABELS: Record<CopyType, string> = {
+  http_loadbalancer: 'HTTP Load Balancer', tcp_loadbalancer: 'TCP Load Balancer', cdn_loadbalancer: 'CDN Load Balancer',
+  origin_pool: 'Origin Pool', healthcheck: 'Health Check',
+  app_firewall: 'WAF Policy', service_policy: 'Service Policy', service_policy_set: 'Service Policy Set',
+  rate_limiter: 'Rate Limiter', rate_limiter_policy: 'Rate Limiter Policy',
+  bot_defense_policy: 'Bot Defense Policy', api_definition: 'API Definition', malicious_user_mitigation: 'Malicious User Mitigation',
+  user_identification: 'User Identification', forward_proxy_policy: 'Forward Proxy Policy',
+  ip_prefix_set: 'IP Prefix Set', bgp_asn_set: 'BGP ASN Set',
+  dns_zone: 'DNS Zone', dns_load_balancer: 'DNS Load Balancer',
+  virtual_site: 'Virtual Site',
+  alert_receiver: 'Alert Receiver', alert_policy: 'Alert Policy', global_log_receiver: 'Global Log Receiver',
+  cdn_cache_rule: 'CDN Cache Rule',
+  certificate: 'TLS Certificate', trusted_ca_list: 'Trusted CA List',
+};
+
+// Grouped for the selector UI.
+const TYPE_CATEGORIES: { label: string; types: CopyType[] }[] = [
+  { label: 'Load Balancers', types: ['http_loadbalancer', 'tcp_loadbalancer', 'cdn_loadbalancer'] },
+  { label: 'Pools & Health', types: ['origin_pool', 'healthcheck'] },
+  { label: 'App Security', types: ['app_firewall', 'service_policy', 'service_policy_set', 'rate_limiter', 'rate_limiter_policy', 'bot_defense_policy', 'api_definition', 'malicious_user_mitigation', 'user_identification', 'forward_proxy_policy'] },
+  { label: 'Matchers & Sets', types: ['ip_prefix_set', 'bgp_asn_set'] },
+  { label: 'DNS', types: ['dns_zone', 'dns_load_balancer'] },
+  { label: 'Network', types: ['virtual_site'] },
+  { label: 'Observability', types: ['alert_receiver', 'alert_policy', 'global_log_receiver'] },
+  { label: 'Content & Certs', types: ['cdn_cache_rule', 'certificate', 'trusted_ca_list'] },
+];
+
+// Namespaces whose objects are global/built-in — referenced, never copied.
+const SHARED_NS = new Set(['shared', 'system', 'ves-io-shared']);
+// Types that carry child references we auto-resolve.
+const PARENT_TYPES: CopyType[] = ['http_loadbalancer', 'tcp_loadbalancer', 'cdn_loadbalancer', 'origin_pool', 'service_policy_set'];
+const hasChildren = (t: CopyType) => PARENT_TYPES.includes(t);
+
+interface DepNode {
+  type: CopyType; name: string; namespace: string;
+  spec: any; obj: any; error?: string; existsInDest?: boolean;
+}
+interface LbTree { root: string; nodes: DepNode[]; } // nodes in create order (children first, LB last)
+
+// Extract the child-object references from a load balancer / origin pool spec.
+function childRefs(type: CopyType, spec: any): Array<{ type: CopyType; name: string; namespace?: string }> {
+  const refs: Array<{ type: CopyType; name: string; namespace?: string }> = [];
+  const add = (ref: any, t: CopyType) => { if (ref && ref.name) refs.push({ type: t, name: ref.name, namespace: ref.namespace }); };
+  if (type === 'http_loadbalancer') {
+    add(spec.app_firewall, 'app_firewall');
+    add(spec.bot_defense?.policy, 'bot_defense_policy');
+    add(spec.user_identification, 'user_identification');
+    (spec.active_service_policies?.policies || []).forEach((p: any) => add(p, 'service_policy'));
+    (spec.rate_limit?.policies?.policies || []).forEach((p: any) => add(p, 'rate_limiter_policy'));
+    (spec.default_route_pools || []).forEach((p: any) => add(p.pool, 'origin_pool'));
+    (spec.routes || []).forEach((r: any) => {
+      (r.simple_route?.origin_pools || []).forEach((d: any) => add(d.pool, 'origin_pool'));
+      (r.route_destination?.destinations || []).forEach((d: any) => add(d.pool, 'origin_pool'));
+    });
+    add(spec.origin_pool, 'origin_pool');
+    add(spec.malicious_user_mitigation, 'malicious_user_mitigation');
+    add(spec.api_definition, 'api_definition');
+  } else if (type === 'tcp_loadbalancer') {
+    (spec.origin_pools || []).forEach((d: any) => add(d.pool, 'origin_pool'));
+    (spec.origin_pools_weights || []).forEach((d: any) => add(d.pool, 'origin_pool'));
+    (spec.active_service_policies?.policies || []).forEach((p: any) => add(p, 'service_policy'));
+  } else if (type === 'service_policy_set') {
+    (spec.policies || []).forEach((p: any) => add(p, 'service_policy'));
+  } else if (type === 'cdn_loadbalancer') {
+    (spec.custom_cache_rule?.cdn_cache_rules || []).forEach((r: any) => add(r, 'cdn_cache_rule'));
+    add(spec.app_firewall, 'app_firewall');
+  } else if (type === 'origin_pool') {
+    (spec.healthcheck || []).forEach((hc: any) => add(hc, 'healthcheck'));
+  }
+  return refs;
+}
+
+// Prepare a spec for creation in the destination: drop read-only fields and
+// repoint same-namespace references to the destination namespace (names stay
+// identical, so cross-tenant/cross-namespace copies resolve correctly).
+function sanitizeSpec(o: any, from: string, to: string): void {
+  if (Array.isArray(o)) { o.forEach(x => sanitizeSpec(x, from, to)); return; }
+  if (o && typeof o === 'object') {
+    const isRef = typeof o.name === 'string' && (typeof o.namespace === 'string' || typeof o.tenant === 'string');
+    if ('uid' in o) delete o.uid;
+    if ('tenant' in o) delete o.tenant;
+    if (isRef && 'kind' in o) delete o.kind;   // read-only on object references
+    if (typeof o.namespace === 'string' && o.namespace === from) o.namespace = to;
+    for (const k of Object.keys(o)) sanitizeSpec(o[k], from, to);
+  }
+}
+
+function buildPayload(node: DepNode, destNs: string, sourceNs: string): any {
+  const obj = node.obj || {};
+  const rawSpec = node.spec || obj.spec || obj.get_spec || {};
+  const spec = JSON.parse(JSON.stringify(rawSpec));
+  sanitizeSpec(spec, sourceNs, destNs);
+  const md = obj.metadata || {};
+  const metadata: Record<string, unknown> = { name: node.name, namespace: destNs };
+  if (md.description) metadata.description = md.description;
+  if (md.labels && Object.keys(md.labels).length) metadata.labels = md.labels;
+  if (md.annotations && Object.keys(md.annotations).length) metadata.annotations = md.annotations;
+  if (md.disable) metadata.disable = md.disable;
+  return { metadata, spec };
+}
+
 interface SelectedObject {
-  type: ConfigObjectType;
+  type: CopyType;
   name: string;
   namespace: string;
   data: AlertReceiver | AlertPolicy | CDNCacheRule;
@@ -41,6 +171,7 @@ interface CopyResult {
   name: string;
   success: boolean;
   error?: string;
+  skipped?: boolean;
 }
 
 export function CopyConfig() {
@@ -69,13 +200,13 @@ export function CopyConfig() {
   const [selectedDestNs, setSelectedDestNs] = useState('');
 
   // Config object selection
-  const [selectedObjectType, setSelectedObjectType] = useState<ConfigObjectType>('alert_receiver');
+  const [selectedObjectType, setSelectedObjectType] = useState<CopyType>('alert_receiver');
   const [availableObjects, setAvailableObjects] = useState<Array<{ name: string; data: unknown }>>([]);
   const [selectedObjects, setSelectedObjects] = useState<string[]>([]);
   const [isLoadingObjects, setIsLoadingObjects] = useState(false);
 
   // Preview & Copy
-  const [objectsToPreview, setObjectsToPreview] = useState<SelectedObject[]>([]);
+  const [depTrees, setDepTrees] = useState<LbTree[]>([]);
   const [expandedPreview, setExpandedPreview] = useState<string | null>(null);
   const [isCopying, setIsCopying] = useState(false);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
@@ -161,31 +292,12 @@ export function CopyConfig() {
     setSelectedObjects([]);
 
     try {
-      let items: Array<{ name: string; data: unknown }> = [];
-
-      if (selectedObjectType === 'alert_receiver') {
-        const resp = await apiClient.getAlertReceivers(selectedSourceNs);
-        items = (resp.items || []).map(item => ({
-          name: item.metadata?.name || item.name || 'unknown',
-          data: item,
-        }));
-      } else if (selectedObjectType === 'alert_policy') {
-        const resp = await apiClient.getAlertPolicies(selectedSourceNs);
-        items = (resp.items || []).map(item => ({
-          name: item.metadata?.name || item.name || 'unknown',
-          data: item,
-        }));
-      } else if (selectedObjectType === 'cdn_cache_rule') {
-        const resp = await apiClient.getCDNCacheRules(selectedSourceNs);
-        items = (resp.items || []).map(item => ({
-          name: item.metadata?.name || item.name || 'unknown',
-          data: item,
-        }));
-      }
-
+      // Generic list — works for every namespaced config object type.
+      const resp: any = await apiClient.get(`/api/config/namespaces/${selectedSourceNs}/${API_PATHS[selectedObjectType]}`);
+      const items = (resp.items || []).map((item: any) => ({ name: item.name || item.metadata?.name || 'unknown', data: item }));
       setAvailableObjects(items);
     } catch (err) {
-      toast.error(`Failed to load ${selectedObjectType.replace('_', ' ')}s`);
+      toast.error(`Failed to load ${TYPE_LABELS[selectedObjectType]}s`);
     } finally {
       setIsLoadingObjects(false);
     }
@@ -211,193 +323,105 @@ export function CopyConfig() {
     setSelectedObjects([]);
   };
 
-  const preparePreview = async () => {
-    setIsLoadingPreview(true);
-    const previews: SelectedObject[] = [];
+  // ─── Fetchers (source = current tenant; dest = current or remote tenant) ──
+  const sourceGet = (path: string): Promise<any> => apiClient.get(path);
+  const destGet = (path: string): Promise<any> =>
+    copyMode === 'cross-tenant'
+      ? F5XCApiClient.proxyRequestStatic(destTenant.trim(), destApiToken.trim(), path, 'GET')
+      : apiClient.get(path);
+  const destPost = (path: string, body: unknown): Promise<any> =>
+    copyMode === 'cross-tenant'
+      ? F5XCApiClient.proxyRequestStatic(destTenant.trim(), destApiToken.trim(), path, 'POST', body)
+      : apiClient.post(path, body);
 
-    // Fetch full details for each selected object
-    // The list API often returns minimal data, we need to GET each object individually
-    for (const name of selectedObjects) {
-      try {
-        let fullData: AlertReceiver | AlertPolicy | CDNCacheRule;
-
-        if (selectedObjectType === 'alert_receiver') {
-          fullData = await apiClient.getAlertReceiver(selectedSourceNs, name);
-        } else if (selectedObjectType === 'alert_policy') {
-          fullData = await apiClient.getAlertPolicy(selectedSourceNs, name);
-        } else {
-          fullData = await apiClient.getCDNCacheRule(selectedSourceNs, name);
-        }
-        
-        console.log(`[CopyConfig] Fetched full details for ${name}:`, JSON.stringify(fullData, null, 2));
-        
-        previews.push({
-          type: selectedObjectType,
-          name,
-          namespace: selectedSourceNs,
-          data: fullData,
-        });
-      } catch (err) {
-        console.error(`[CopyConfig] Failed to fetch details for ${name}:`, err);
-        toast.error(`Failed to fetch details for ${name}`);
-      }
-    }
-
-    setObjectsToPreview(previews);
-    setIsLoadingPreview(false);
-    setStep(3);
+  // Does an object already exist in the destination namespace?
+  const existsInDest = async (type: CopyType, name: string, ns: string): Promise<boolean> => {
+    try { await destGet(`/api/config/namespaces/${ns}/${API_PATHS[type]}/${encodeURIComponent(name)}`); return true; }
+    catch { return false; }
   };
 
-  const prepareCreatePayload = (original: AlertReceiver | AlertPolicy | CDNCacheRule, destNamespace: string, _destTenantName?: string): unknown => {
-    // Deep clone the original object
-    const source: Record<string, unknown> = JSON.parse(JSON.stringify(original));
-
-    console.log('[CopyConfig] Original source object:', JSON.stringify(source, null, 2));
-
-    // F5 XC API expects a specific structure for POST requests:
-    // { metadata: { name, namespace, ... }, spec: { ... } }
-    
-    // Extract the name - could be in metadata.name or at root level
-    const objectName = (source.metadata as Record<string, unknown>)?.name || source.name;
-    
-    // CRITICAL: F5 XC list API returns spec in 'get_spec', not 'spec'
-    // We need to prioritize get_spec over spec
-    const spec = source.get_spec || source.spec || {};
-    
-    console.log('[CopyConfig] Extracted spec:', JSON.stringify(spec, null, 2));
-    
-    // Extract description and labels from metadata or root
-    const sourceMetadata = (source.metadata || {}) as Record<string, unknown>;
-    const description = sourceMetadata.description || source.description || '';
-    const labels = sourceMetadata.labels || source.labels || {};
-    const annotations = sourceMetadata.annotations || source.annotations || {};
-    const disable = sourceMetadata.disable || source.disabled || false;
-
-    // Build clean metadata for the create request
-    const metadata: Record<string, unknown> = {
-      name: objectName,
-      namespace: destNamespace,
-    };
-
-    // Only add optional fields if they have values
-    if (description) metadata.description = description;
-    if (labels && Object.keys(labels as object).length > 0) metadata.labels = labels;
-    if (annotations && Object.keys(annotations as object).length > 0) metadata.annotations = annotations;
-    if (disable) metadata.disable = disable;
-
-    // Deep clone the spec to avoid mutations
-    const cleanSpec: Record<string, unknown> = JSON.parse(JSON.stringify(spec));
-    
-    // For alert receivers, clean up receiver-specific fields
-    if (selectedObjectType === 'alert_receiver') {
-      // Alert receivers don't need namespace updates in spec, just copy as-is
-      // But remove any tenant references that might cause issues
-      // The spec structure varies by receiver type (slack, pagerduty, email, etc.)
-    }
-    
-    // For alert policies, update receiver references to point to destination namespace
-    if (selectedObjectType === 'alert_policy') {
-      // Update top-level receiver references
-      if (cleanSpec.receivers && Array.isArray(cleanSpec.receivers)) {
-        cleanSpec.receivers = (cleanSpec.receivers as Array<Record<string, unknown>>).map(r => {
-          // Keep only name and namespace, remove tenant/kind which are read-only
-          return {
-            name: r.name,
-            namespace: destNamespace,
-          };
-        });
-      }
-
-      // Update routes - preserve ALL route fields, just update receiver namespaces
-      if (cleanSpec.routes && Array.isArray(cleanSpec.routes)) {
-        cleanSpec.routes = (cleanSpec.routes as Array<Record<string, unknown>>).map(route => {
-          const cleanRoute: Record<string, unknown> = { ...route };
-          
-          // Update receivers in the route if present
-          if (cleanRoute.receivers && Array.isArray(cleanRoute.receivers)) {
-            cleanRoute.receivers = (cleanRoute.receivers as Array<Record<string, unknown>>).map(r => ({
-              name: r.name,
-              namespace: destNamespace,
-            }));
-          }
-          
-          return cleanRoute;
-        });
-      }
-      
-      // Copy notification_parameters if present
-      // Copy notification_grouping if present
-      // These are already in cleanSpec from the deep clone
-    }
-
-    // Build the final payload in the format F5 XC API expects
-    const payload: Record<string, unknown> = {
-      metadata,
-      spec: cleanSpec,
-    };
-
-    console.log('[CopyConfig] Final prepared payload:', JSON.stringify(payload, null, 2));
-
-    return payload;
-  };
-
-  const executeCopy = async () => {
-    const targetNamespace = copyMode === 'cross-tenant' ? selectedDestNs : selectedDestNs;
-    const targetTenant = copyMode === 'cross-tenant' ? destTenant : tenant;
-    const targetToken = copyMode === 'cross-tenant' ? destApiToken : null;
-
-    if (!targetNamespace) {
-      toast.warning('Please select a destination namespace');
+  // DFS from a load balancer, fetching each object's spec and recursing into its
+  // children. Produces a post-order list (children first, LB last) — the create
+  // order. Shared/system references and cross-namespace refs are left as links.
+  const resolveTree = async (rootType: CopyType, rootName: string, rootNs: string, visited: Set<string>, ordered: DepNode[]): Promise<void> => {
+    const key = `${rootType}:${rootName}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+    let obj: any = null, spec: any = null;
+    try {
+      obj = await sourceGet(`/api/config/namespaces/${rootNs}/${API_PATHS[rootType]}/${encodeURIComponent(rootName)}`);
+      spec = obj.spec || obj.get_spec;
+    } catch {
+      ordered.push({ type: rootType, name: rootName, namespace: rootNs, spec: null, obj: null, error: 'Source fetch failed' });
       return;
     }
+    for (const c of childRefs(rootType, spec || {})) {
+      const cns = c.namespace || rootNs;
+      if (SHARED_NS.has(cns)) continue;   // global/built-in — reference, don't copy
+      if (cns !== rootNs) continue;       // lives in another namespace — leave as link
+      await resolveTree(c.type, c.name, rootNs, visited, ordered);
+    }
+    ordered.push({ type: rootType, name: rootName, namespace: rootNs, spec, obj });
+  };
 
+  const preparePreview = async () => {
+    setIsLoadingPreview(true);
+    setDepTrees([]);
+    const trees: LbTree[] = [];
+    try {
+      for (const name of selectedObjects) {
+        const visited = new Set<string>();
+        const ordered: DepNode[] = [];
+        await resolveTree(selectedObjectType, name, selectedSourceNs, visited, ordered);
+        for (const node of ordered) {
+          node.existsInDest = node.error ? false : await existsInDest(node.type, node.name, selectedDestNs);
+        }
+        trees.push({ root: name, nodes: ordered });
+      }
+      setDepTrees(trees);
+      setStep(3);
+    } catch (err) {
+      toast.error(`Failed to resolve dependencies: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setIsLoadingPreview(false);
+    }
+  };
+
+
+  // Copy a load balancer with all its children, in dependency order.
+  const executeCopyLb = async () => {
     setIsCopying(true);
     setCopyResults([]);
     const results: CopyResult[] = [];
-
-    for (const obj of objectsToPreview) {
-      try {
-        const payload = prepareCreatePayload(obj.data, targetNamespace);
-        const apiPath = selectedObjectType === 'alert_receiver' ? 'alert_receivers'
-          : selectedObjectType === 'alert_policy' ? 'alert_policys'
-          : 'cdn_cache_rules';
-
-        if (copyMode === 'cross-tenant' && targetToken) {
-          await F5XCApiClient.proxyRequestStatic(
-            targetTenant!,
-            targetToken,
-            `/api/config/namespaces/${targetNamespace}/${apiPath}`,
-            'POST',
-            payload
-          );
-        } else {
-          await apiClient.post(`/api/config/namespaces/${targetNamespace}/${apiPath}`, payload);
+    for (const tree of depTrees) {
+      for (const node of tree.nodes) {
+        const label = `${TYPE_LABELS[node.type]}: ${node.name}`;
+        let exists = node.existsInDest === true;
+        if (!exists && !node.error) exists = await existsInDest(node.type, node.name, selectedDestNs);
+        if (exists) { results.push({ name: label, success: true, skipped: true }); continue; }
+        if (node.error || !node.obj) { results.push({ name: label, success: false, error: node.error || 'No source data' }); continue; }
+        try {
+          const payload = buildPayload(node, selectedDestNs, selectedSourceNs);
+          await destPost(`/api/config/namespaces/${selectedDestNs}/${API_PATHS[node.type]}`, payload);
+          results.push({ name: label, success: true });
+        } catch (err) {
+          results.push({ name: label, success: false, error: err instanceof Error ? err.message : 'Unknown error' });
         }
-
-        results.push({ name: obj.name, success: true });
-      } catch (err) {
-        results.push({
-          name: obj.name,
-          success: false,
-          error: err instanceof Error ? err.message : 'Unknown error',
-        });
       }
     }
-
     setCopyResults(results);
     setStep(4);
     setIsCopying(false);
+    const created = results.filter(r => r.success && !r.skipped).length;
+    const skipped = results.filter(r => r.skipped).length;
+    const failed = results.filter(r => !r.success).length;
+    if (failed === 0) toast.success(`Copied ${created} object(s)${skipped ? `, ${skipped} already existed` : ''}`);
+    else toast.warning(`Created ${created}, skipped ${skipped}, failed ${failed}`);
+  };
 
-    const successCount = results.filter(r => r.success).length;
-    const failCount = results.filter(r => !r.success).length;
-
-    if (failCount === 0) {
-      toast.success(`Successfully copied ${successCount} object(s)`);
-    } else if (successCount === 0) {
-      toast.error(`Failed to copy all ${failCount} object(s)`);
-    } else {
-      toast.warning(`Copied ${successCount}, failed ${failCount}`);
-    }
+  const executeCopy = async () => {
+    if (!selectedDestNs) { toast.warning('Please select a destination namespace'); return; }
+    await executeCopyLb();
   };
 
   const resetWizard = () => {
@@ -410,8 +434,16 @@ export function CopyConfig() {
     setDestValidated(false);
     setDestNamespaces([]);
     setSelectedObjects([]);
-    setObjectsToPreview([]);
+    setDepTrees([]);
     setCopyResults([]);
+  };
+
+  // After a copy: keep the tenant/namespace setup, go back to type selection.
+  const resetForNewType = () => {
+    setSelectedObjects([]);
+    setDepTrees([]);
+    setCopyResults([]);
+    setStep(2);
   };
 
   const getReceiverType = (receiver: AlertReceiver): string => {
@@ -440,7 +472,8 @@ export function CopyConfig() {
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <button
-              onClick={() => step === 1 ? navigate('/') : step === 2 ? setStep(1) : setStep(2)}
+              onClick={() => step === 1 ? navigate('/') : setStep((step - 1) as Step)}
+              title={step === 1 ? 'Back to Home' : 'Previous step'}
               className="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition-colors"
             >
               <ArrowLeft className="w-5 h-5" />
@@ -742,33 +775,45 @@ export function CopyConfig() {
             {/* Object Type Selector */}
             <div className="p-4 bg-slate-800/50 border border-slate-700 rounded-xl">
               <p className="text-xs text-slate-500 mb-3">Select a config type to load objects from <span className="text-blue-400 font-medium">{selectedSourceNs}</span>:</p>
-              <div className="flex gap-3">
-                {(['alert_receiver', 'alert_policy', 'cdn_cache_rule'] as ConfigObjectType[]).map(type => (
-                  <button
-                    key={type}
-                    onClick={() => setSelectedObjectType(type)}
-                    className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold border-2 transition-all ${
-                      selectedObjectType === type
-                        ? 'bg-blue-500 border-blue-500 text-white shadow-lg shadow-blue-500/20'
-                        : 'bg-slate-700 border-slate-600 text-slate-300 hover:border-blue-500/50 hover:text-white'
-                    }`}
-                  >
-                    {selectedObjectType === type && isLoadingObjects
-                      ? <Loader2 className="w-4 h-4 animate-spin" />
-                      : selectedObjectType === type
-                      ? <Check className="w-4 h-4" />
-                      : null}
-                    {type === 'alert_receiver' ? 'Alert Receivers' : type === 'alert_policy' ? 'Alert Policies' : 'CDN Cache Rules'}
-                  </button>
+              <div className="space-y-3">
+                {TYPE_CATEGORIES.map(cat => (
+                  <div key={cat.label} className="flex items-start gap-3">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 w-28 flex-shrink-0 pt-2">{cat.label}</span>
+                    <div className="flex flex-wrap gap-2">
+                      {cat.types.map(type => (
+                        <button
+                          key={type}
+                          onClick={() => setSelectedObjectType(type)}
+                          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                            selectedObjectType === type
+                              ? 'bg-blue-500 border-blue-500 text-white shadow shadow-blue-500/20'
+                              : 'bg-slate-700/60 border-slate-600 text-slate-300 hover:border-blue-500/50 hover:text-white'
+                          }`}
+                        >
+                          {selectedObjectType === type && isLoadingObjects
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : selectedObjectType === type
+                            ? <Check className="w-3.5 h-3.5" />
+                            : hasChildren(type) ? <Server className="w-3.5 h-3.5 opacity-60" /> : null}
+                          {TYPE_LABELS[type]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
+              {hasChildren(selectedObjectType) && (
+                <p className="mt-3 text-xs text-emerald-400/90 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" /> Child objects (origin pools, WAF, service &amp; rate-limit policies, health checks…) are auto-detected and created first if missing.
+                </p>
+              )}
             </div>
 
             {/* Objects List */}
             <div className="bg-slate-800/50 border border-slate-700 rounded-xl">
               <div className="flex items-center justify-between px-4 py-3 border-b border-slate-700">
                 <span className="text-sm font-semibold text-slate-300">
-                  Available {selectedObjectType === 'alert_receiver' ? 'Alert Receivers' : selectedObjectType === 'alert_policy' ? 'Alert Policies' : 'CDN Cache Rules'}
+                  Available {TYPE_LABELS[selectedObjectType]}s
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -793,7 +838,7 @@ export function CopyConfig() {
                   </div>
                 ) : availableObjects.length === 0 ? (
                   <div className="text-center py-12 text-slate-500">
-                    No {selectedObjectType === 'alert_receiver' ? 'alert receivers' : selectedObjectType === 'alert_policy' ? 'alert policies' : 'CDN cache rules'} found in {selectedSourceNs}
+                    No {TYPE_LABELS[selectedObjectType].toLowerCase()}s found in {selectedSourceNs}
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -918,55 +963,42 @@ export function CopyConfig() {
               </div>
             </div>
 
-            {/* Objects to Copy */}
-            <div className="bg-slate-800/50 border border-slate-700 rounded-xl">
-              <div className="px-4 py-3 border-b border-slate-700">
-                <span className="text-sm font-semibold text-slate-300">
-                  Objects to Copy ({objectsToPreview.length})
-                </span>
-              </div>
-              <div className="divide-y divide-slate-700">
-                {objectsToPreview.map(obj => (
-                  <div key={obj.name} className="p-4">
-                    <div
-                      className="flex items-center justify-between cursor-pointer"
-                      onClick={() => setExpandedPreview(expandedPreview === obj.name ? null : obj.name)}
-                    >
-                      <div className="flex items-center gap-3">
-                        {expandedPreview === obj.name ? (
-                          <ChevronDown className="w-5 h-5 text-slate-400" />
-                        ) : (
-                          <ChevronRight className="w-5 h-5 text-slate-400" />
-                        )}
-                        <span className="text-slate-200 font-medium">{obj.name}</span>
-                        <span className="px-2 py-0.5 bg-slate-700 rounded text-xs text-slate-400">
-                          {obj.type === 'alert_receiver' ? 'Alert Receiver' : 'Alert Policy'}
-                        </span>
-                      </div>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setJsonModal({
-                            title: `${obj.name} (Create Payload)`,
-                            data: prepareCreatePayload(obj.data, selectedDestNs),
-                          });
-                        }}
-                        className="p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-700 rounded transition-colors"
-                      >
-                        <Code className="w-4 h-4" />
-                      </button>
+            {/* Objects to create (dependency tree, children first) */}
+            <div className="space-y-4">
+              {depTrees.map(tree => {
+                const deps = tree.nodes.length - 1;
+                return (
+                  <div key={tree.root} className="bg-slate-800/50 border border-slate-700 rounded-xl overflow-hidden">
+                    <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2">
+                      <Server className="w-4 h-4 text-blue-400" />
+                      <span className="text-sm font-semibold text-slate-200">{tree.root}</span>
+                      <span className="px-2 py-0.5 bg-blue-500/10 text-blue-300 rounded text-xs">{TYPE_LABELS[selectedObjectType]}</span>
+                      <span className="ml-auto text-xs text-slate-500">{deps > 0 ? `${deps} dependenc${deps === 1 ? 'y' : 'ies'}` : 'no dependencies'}</span>
                     </div>
-
-                    {expandedPreview === obj.name && (
-                      <div className="mt-4 p-4 bg-slate-900/50 rounded-lg">
-                        <pre className="text-xs text-slate-400 overflow-auto max-h-64">
-                          {JSON.stringify(prepareCreatePayload(obj.data, selectedDestNs), null, 2)}
-                        </pre>
-                      </div>
-                    )}
+                    <div className="divide-y divide-slate-700/60">
+                      {tree.nodes.map((node, i) => {
+                        const isRoot = i === tree.nodes.length - 1;
+                        const status = node.error ? 'error' : node.existsInDest ? 'exists' : 'create';
+                        return (
+                          <div key={`${node.type}:${node.name}`} className={`px-4 py-2.5 flex items-center gap-3 ${isRoot ? 'bg-blue-500/5' : ''}`}>
+                            <span className="text-slate-600 w-4 text-center flex-shrink-0">{isRoot ? '' : '↳'}</span>
+                            <span className="px-2 py-0.5 rounded text-[11px] bg-slate-700 text-slate-300 w-36 text-center flex-shrink-0">{TYPE_LABELS[node.type]}</span>
+                            <span className="text-sm text-slate-200 truncate flex-1">{node.name}</span>
+                            {status === 'exists' && <span className="text-xs px-2 py-0.5 rounded bg-slate-600/40 text-slate-400 flex items-center gap-1 flex-shrink-0"><Check className="w-3 h-3" /> Exists — skip</span>}
+                            {status === 'create' && <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 flex items-center gap-1 flex-shrink-0"><Copy className="w-3 h-3" /> Will create</span>}
+                            {status === 'error' && <span className="text-xs px-2 py-0.5 rounded bg-red-500/15 text-red-300 flex items-center gap-1 flex-shrink-0"><XCircle className="w-3 h-3" /> {node.error}</span>}
+                            {!node.error && node.obj && (
+                              <button onClick={() => setJsonModal({ title: `${node.name} (Create Payload)`, data: buildPayload(node, selectedDestNs, selectedSourceNs) })} className="p-1.5 text-slate-500 hover:text-slate-300 hover:bg-slate-700 rounded flex-shrink-0">
+                                <Code className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                ))}
-              </div>
+                );
+              })}
             </div>
 
             {/* Warning */}
@@ -975,15 +1007,10 @@ export function CopyConfig() {
               <div>
                 <span className="text-amber-400 font-semibold block">Before you proceed</span>
                 <span className="text-sm text-slate-400">
-                  This will create new objects in the destination namespace. If objects with the same name already exist, the operation may fail.
-                  {selectedObjectType === 'alert_policy' && (
-                    <span className="block mt-1">
-                      Alert Policies reference Alert Receivers. Make sure the referenced receivers exist in the destination namespace.
-                    </span>
-                  )}
-                  {selectedObjectType === 'cdn_cache_rule' && (
-                    <span className="block mt-1">
-                      CDN Cache Rules are standalone objects. After copying, attach them to your CDN Load Balancer in the destination namespace.
+                  Objects are created in dependency order (children first). Objects that already exist in the destination are skipped, not overwritten — names are kept identical. Shared/system references and objects in other namespaces are left as links.
+                  {selectedObjectType === 'certificate' && (
+                    <span className="block mt-1 text-amber-300/80">
+                      TLS Certificates hold tenant-encrypted (blindfold) secrets — a cross-tenant copy of the private key will not decrypt and may need re-import.
                     </span>
                   )}
                 </span>
@@ -1008,7 +1035,7 @@ export function CopyConfig() {
                 ) : (
                   <Copy className="w-5 h-5" />
                 )}
-                Copy {objectsToPreview.length} Object{objectsToPreview.length !== 1 ? 's' : ''}
+                {`Create ${depTrees.reduce((s, t) => s + t.nodes.filter(n => !n.existsInDest && !n.error).length, 0)} object(s)`}
               </button>
             </div>
           </div>
@@ -1066,6 +1093,9 @@ export function CopyConfig() {
                     {result.error && (
                       <span className="text-sm text-red-400">{result.error}</span>
                     )}
+                    {result.skipped && (
+                      <span className="text-xs text-slate-500">already existed — skipped</span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1074,11 +1104,19 @@ export function CopyConfig() {
             {/* Action Buttons */}
             <div className="flex justify-center gap-4">
               <button
+                onClick={resetForNewType}
+                className="flex items-center gap-2 px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-semibold rounded-lg transition-colors"
+                title={`Keep ${tenant}/${selectedSourceNs} → ${selectedDestNs} and copy a different config type`}
+              >
+                <Copy className="w-5 h-5" />
+                Copy Another Type
+              </button>
+              <button
                 onClick={resetWizard}
                 className="flex items-center gap-2 px-6 py-3 bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold rounded-lg transition-colors"
               >
                 <RefreshCw className="w-5 h-5" />
-                Start New Copy
+                Start Over
               </button>
               <Link
                 to="/"

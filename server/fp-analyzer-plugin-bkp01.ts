@@ -86,7 +86,6 @@ export function fpAnalyzerPlugin(): Plugin {
             namespace: parsed.namespace,
             lbName: parsed.lbName,
             domains: parsed.domains || [],
-            allDomains: Array.isArray(parsed.allDomains) ? parsed.allDomains : [],
             scopes: scopes.length ? scopes : ['waf_signatures', 'waf_violations'],
             hoursBack: parsed.hoursBack || 168,
           };
